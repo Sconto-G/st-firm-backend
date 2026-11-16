@@ -12,8 +12,13 @@ CORS(app)
 
 # --- CONFIGURATION ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# --- CONFIGURATION ---
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if GEMINI_API_KEY:
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    client = genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=types.HttpOptions(timeout=30_000) # 30 seconds in milliseconds
+    )
 else:
     client = None
 
@@ -107,11 +112,8 @@ def chat():
             response = client.models.generate_content(
                 model=model_name,
                 contents=sys_prompt + "\nUser: " + user_message,
-                config=types.GenerateContentConfig(
-                    temperature=0.2,
-                    timeout=30
-                )
-            )
+                config=types.GenerateContentConfig(temperature=0. 2)
+        
             return jsonify({"reply": response.text})
         except Exception as e:
             last_error = str(e)
