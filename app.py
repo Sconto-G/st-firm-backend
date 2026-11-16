@@ -1,11 +1,21 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 import requests
 import threading
 import time
+import os
+import google.generativeai as genai
 
 app = Flask(__name__)
 CORS(app)
+
+# --- CONFIGURATION ---
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    ai_model = genai.GenerativeModel('gemini-1.5-flash')
+else:
+    ai_model = None
 
 market_state = {
     "current_price": "4586.11",
@@ -26,10 +36,8 @@ price_history = []
 def calculate_trend(prices):
     if len(prices) < 10:
         return "WAITING", "WAITING"
-    # Compare recent prices to older prices to determine trend
     recent = sum(prices[-3:]) / 3
     older = sum(prices[:3]) / 3
-    
     if recent > older:
         return "UPTREND", "BULLISH"
     elif recent < older:
@@ -39,7 +47,6 @@ def calculate_trend(prices):
 def fetch_gold_price():
     while True:
         try:
-            # Fetch live gold price from a reliable public API
             response = requests.get("https://api.gold-api.com/price/XAU", timeout=10)
             data = response.json()
             live_price = float(data['price'])
@@ -47,19 +54,14 @@ def fetch_gold_price():
             market_state["current_price"] = str(round(live_price, 2))
             price_history.append(live_price)
             
-            # Keep history manageable
             if len(price_history) > 50:
                 price_history.pop(0)
             
-            # Calculate trend if we have enough data
             if len(price_history) > 5:
                 trend, bias = calculate_trend(price_history)
                 
-                market_state["timeframes"]["M5"] = {"trend": trend, "bias": bias}
-                market_state["timeframes"]["M30"] = {"trend": trend, "bias": bias}
-                market_state["timeframes"]["H1"] = {"trend": trend, "bias": bias}
-                market_state["timeframes"]["H4"] = {"trend": trend, "bias": bias}
-                market_state["timeframes"]["D1"] = {"trend": trend, "bias": bias}
+                for tf in ["M5", "M30", "H1", "H4", "D1"]:
+                    market_state["timeframes"][tf] = {"trend": trend, "bias": bias}
                 
                 if bias == "BULLISH":
                     market_state["market_posture"] = "BUY"
@@ -71,16 +73,40 @@ def fetch_gold_price():
         except Exception as e:
             print(f"Error fetching data: {e}")
         
-        time.sleep(5) # Update every 5 seconds
+        time.sleep(5)
 
 @app.route('/api/v1/market/xauusd')
 def get_market_data():
     return jsonify(market_state)
 
+@app.route('/api/v1/chat', methods=['POST'])
+def chat():
+    if not ai_model:
+        return jsonify({"reply": "Error: AI API key not configured in Render."}), 500
+
+    user_message = request.json.get("message", "")
+    
+    # Build the Deadly System Prompt
+    sys_prompt = f"""
+    You are the ST-FIRM WATCHER AI, a deadly, analytical, no-nonsense gold trader.
+    You do not give generic advice or stories. You look at live data and give sharp, military-grade precision.
+    Here is the current live market data:
+    - XAUUSD Price: {market_state['current_price']}
+    - Overall Posture: {market_state['market_posture']} (Confidence: {market_state['confidence']}%)
+    - M30 Trend: {market_state['timeframes']['M30']['trend']}
+    
+    The user (Besti) will ask you a question. Answer directly, analyzing the data provided. 
+    If Besti asks to buy or sell, check the posture and trend first. Protect capital above all else.
+    """
+    
+    try:
+        response = ai_model.generate_content(sys_prompt + "\nUser: " + user_message)
+        return jsonify({"reply": response.text})
+    except Exception as e:
+        return jsonify({"reply": f"AI Error: {str(e)}"}), 500
+
 if __name__ == '__main__':
-    # Start the live price fetching thread
     thread = threading.Thread(target=fetch_gold_price)
     thread.daemon = True
     thread.start()
-    
     app.run(host='0.0.0.0', port=10000)
