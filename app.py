@@ -4,6 +4,8 @@ import requests
 import threading
 import time
 import os
+import json
+import websocket
 from google import genai
 from google.genai import types
 
@@ -12,6 +14,9 @@ CORS(app)
 
 # --- CONFIGURATION ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+DERIV_TOKEN = os.environ.get("DERIV_TOKEN")
+DERIV_APP_ID = "1089"
+
 if GEMINI_API_KEY:
     client = genai.Client(
         api_key=GEMINI_API_KEY,
@@ -20,7 +25,6 @@ if GEMINI_API_KEY:
 else:
     client = None
 
-# Models to try
 MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
 
 market_state = {
@@ -65,7 +69,6 @@ def fetch_gold_price():
             
             if len(price_history) > 5:
                 trend, bias = calculate_trend(price_history)
-                
                 for tf in ["M5", "M30", "H1", "H4", "D1"]:
                     market_state["timeframes"][tf] = {"trend": trend, "bias": bias}
                 
@@ -91,17 +94,14 @@ def chat():
         return jsonify({"reply": "Error: AI API key not configured."}), 500
 
     user_message = request.json.get("message", "")
-    
     sys_prompt = f"""
-    You are the ST-FIRM WATCHER AI, a deadly, analytical, no-nonsense gold trader.
-    You do not give generic advice or stories. You look at live data and give sharp, military-grade precision.
+    You are the ST-FIRM WATCHER AI, an elite, cold-blooded institutional gold trader.
+    You are not a teacher. You are a weapon designed to extract liquidity from the market.
     Here is the current live market data:
     - XAUUSD Price: {market_state['current_price']}
     - Overall Posture: {market_state['market_posture']} (Confidence: {market_state['confidence']}%)
     - M30 Trend: {market_state['timeframes']['M30']['trend']}
-    
-    The user (Besti) will ask you a question. Answer directly, analyzing the data provided. 
-    If Besti asks to buy or sell, check the posture and trend first. Protect capital above all else.
+    Answer Besti with extreme brevity, military precision, and focus on capital preservation.
     """
     
     last_error = None
@@ -116,8 +116,93 @@ def chat():
         except Exception as e:
             last_error = str(e)
             continue
+    return jsonify({"reply": f"AI Error: {last_error}"}), 500
+
+# --- THE NUCLEAR TRADING ENGINE ---
+def execute_deriv_trade(direction, lots):
+    if not DERIV_TOKEN:
+        return {"status": "error", "message": "DERIV_TOKEN missing in Render environment"}
+
+    ws_url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+    
+    # Standard Deriv Volatility/Commodities contract details
+    # For XAUUSD, we use a multiplier contract or standard CALL/PUT.
+    # We will use a simple CALL/PUT with a 5-tick duration as a test.
+    trade_request = {
+        "buy": 1,
+        "price": 10.0, # Fixed stake of $10 for testing
+        "parameters": {
+            "amount": 10.0,
+            "basis": "stake",
+            "contract_type": "MULTUP" if direction == "BUY" else "MULTDOWN", # Multiplier for Gold
+            "currency": "USD",
+            "duration": 5,
+            "duration_unit": "t",
+            "symbol": "frxXAUUSD",
+            "multiplier": 100
+        }
+    }
+    
+    # NOTE: Deriv requires symbol 'frxXAUUSD' for standard accounts, but for multipliers it might be 'cryXAUUSD' or similar. 
+    # For a robust test, we will use CALL/PUT on frxXAUUSD.
+    trade_request = {
+        "buy": 1,
+        "price": 100, 
+        "parameters": {
+            "amount": 10, 
+            "basis": "stake", 
+            "contract_type": direction, # CALL or PUT
+            "currency": "USD", 
+            "duration": 5, 
+            "duration_unit": "t", 
+            "symbol": "frxXAUUSD"
+        }
+    }
+    
+    # We map SELL -> PUT, BUY -> CALL
+    trade_request["parameters"]["contract_type"] = "CALL" if direction == "BUY" else "PUT"
+
+    response_data = {"status": "pending", "message": "Connecting to Deriv..."}
+
+    def on_open(ws):
+        ws.send(json.dumps({"authorize": DERIV_TOKEN}))
+        
+    def on_message(ws, message):
+        nonlocal response_data
+        data = json.loads(message)
+        
+        if 'error' in data:
+            response_data = {"status": "error", "message": data['error']['message']}
+            ws.close()
+            return
             
-    return jsonify({"reply": f"AI Error (all models failed): {last_error}"}), 500
+        if 'authorize' in data:
+            # Successfully authorized, now send the trade
+            ws.send(json.dumps(trade_request))
+            
+        elif 'buy' in data:
+            # Trade executed successfully!
+            response_data = {
+                "status": "success", 
+                "message": f"EXECUTED: {direction} {lots} Lots",
+                "contract_id": data['buy']['contract_id']
+            }
+            ws.close()
+
+    ws = websocket.WebSocketApp(ws_url, on_open=on_open, on_message=on_message)
+    ws.run_forever()
+    
+    return response_data
+
+@app.route('/api/v1/trade', methods=['POST'])
+def trade():
+    order_data = request.json
+    direction = order_data.get("direction", "SELL") # BUY or SELL
+    lots = order_data.get("lots", 0.10)
+    
+    print(f"⚡ INITIATING NUCLEAR STRIKE: {direction}")
+    result = execute_deriv_trade(direction, lots)
+    return jsonify(result)
 
 if __name__ == '__main__':
     thread = threading.Thread(target=fetch_gold_price)
