@@ -4,7 +4,8 @@ import requests
 import threading
 import time
 import os
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 app = Flask(__name__)
 CORS(app)
@@ -12,10 +13,12 @@ CORS(app)
 # --- CONFIGURATION ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    ai_model = genai.GenerativeModel('gemini-3.8-flash')
+    client = genai.Client(api_key=GEMINI_API_KEY)
 else:
-    ai_model = None
+    client = None
+
+# Models to try, in order of preference
+MODELS = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
 
 market_state = {
     "current_price": "4586.11",
@@ -81,12 +84,11 @@ def get_market_data():
 
 @app.route('/api/v1/chat', methods=['POST'])
 def chat():
-    if not ai_model:
-        return jsonify({"reply": "Error: AI API key not configured in Render."}), 500
+    if not client:
+        return jsonify({"reply": "Error: AI API key not configured."}), 500
 
     user_message = request.json.get("message", "")
     
-    # Build the Deadly System Prompt
     sys_prompt = f"""
     You are the ST-FIRM WATCHER AI, a deadly, analytical, no-nonsense gold trader.
     You do not give generic advice or stories. You look at live data and give sharp, military-grade precision.
@@ -99,11 +101,23 @@ def chat():
     If Besti asks to buy or sell, check the posture and trend first. Protect capital above all else.
     """
     
-    try:
-        response = ai_model.generate_content(sys_prompt + "\nUser: " + user_message)
-        return jsonify({"reply": response.text})
-    except Exception as e:
-        return jsonify({"reply": f"AI Error: {str(e)}"}), 500
+    last_error = None
+    for model_name in MODELS:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=sys_prompt + "\nUser: " + user_message,
+                config=types.GenerateContentConfig(
+                    temperature=0.2,
+                    timeout=30
+                )
+            )
+            return jsonify({"reply": response.text})
+        except Exception as e:
+            last_error = str(e)
+            continue
+            
+    return jsonify({"reply": f"AI Error (all models failed): {last_error}"}), 500
 
 if __name__ == '__main__':
     thread = threading.Thread(target=fetch_gold_price)
