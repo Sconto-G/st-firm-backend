@@ -62,29 +62,25 @@ def calculate_confluence():
         if tf["bias"] == "BULLISH": bull_count += 1
         elif tf["bias"] == "BEARISH": bear_count += 1
         
-    total = bull_count + bear_count
-    if total == 0:
-        confidence = 0
-    else:
-        confidence = int((max(bull_count, bear_count) / 5) * 100)
-        
-    market_state["confidence"] = confidence
-    
     if bull_count > bear_count:
         market_state["market_posture"] = "BUY"
     elif bear_count > bull_count:
         market_state["market_posture"] = "SELL"
     else:
         market_state["market_posture"] = "WAITING"
+        
+    total_active = bull_count + bear_count
+    if total_active > 0:
+        market_state["confidence"] = int((max(bull_count, bear_count) / 5) * 100)
+    else:
+        market_state["confidence"] = 0
 
 def on_message(ws, message):
     data = json.loads(message)
     
-    # 1. Handle Live Tick
     if 'tick' in data:
         market_state["current_price"] = str(data['tick']['quote'])
         
-    # 2. Handle Historical Candles
     if 'candles' in data and 'echo_req' in data:
         granularity = data['echo_req'].get('granularity')
         tf_map = {300: "M5", 1800: "M30", 3600: "H1", 14400: "H4", 86400: "D1"}
@@ -93,11 +89,9 @@ def on_message(ws, message):
             analyze_candles(tf_name, data['candles'])
 
 def on_open(ws):
-    # Subscribe to live ticks
     ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
     
-    # Request historical candles for all timeframes
-    granularities = [300, 1800, 3600, 14400, 86400] # M5, M30, H1, H4, D1
+    granularities = [300, 1800, 3600, 14400, 86400]
     for g in granularities:
         req = {
             "ticks_history": SYMBOL,
