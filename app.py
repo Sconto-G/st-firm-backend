@@ -12,18 +12,16 @@ CORS(app)
 
 # --- CONFIGURATION ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-# --- CONFIGURATION ---
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     client = genai.Client(
         api_key=GEMINI_API_KEY,
-        http_options=types.HttpOptions(timeout=30_000) # 30 seconds in milliseconds
+        http_options=types.HttpOptions(timeout=30000)
     )
 else:
     client = None
 
-# Models to try, in order of preference
-MODELS = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
+# Models to try
+MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
 
 market_state = {
     "current_price": "4586.11",
@@ -112,8 +110,8 @@ def chat():
             response = client.models.generate_content(
                 model=model_name,
                 contents=sys_prompt + "\nUser: " + user_message,
-                config=types.GenerateContentConfig(temperature=0. 2)
-                                                   }
+                config=types.GenerateContentConfig(temperature=0.2)
+            )
             return jsonify({"reply": response.text})
         except Exception as e:
             last_error = str(e)
