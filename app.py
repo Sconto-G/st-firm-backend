@@ -113,7 +113,7 @@ def chat():
                 model=model_name,
                 contents=sys_prompt + "\nUser: " + user_message,
                 config=types.GenerateContentConfig(temperature=0. 2)
-        
+                                                   }
             return jsonify({"reply": response.text})
         except Exception as e:
             last_error = str(e)
