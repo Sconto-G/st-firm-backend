@@ -133,7 +133,7 @@ async def async_deriv_trade(direction):
     }
 
     try:
-        async with websockets.connect(ws_url, extra_headers=extra_headers, ping_interval=20, ping_timeout=20) as ws:
+        async with websockets.connect(ws_url, additional_headers=extra_headers, ping_interval=20, ping_timeout=20) as ws:
             # 1. Authorize
             await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
             auth_resp = json.loads(await ws.recv())
