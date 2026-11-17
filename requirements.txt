@@ -2,5 +2,4 @@ Flask
 flask-cors
 requests
 google-genai
-python-deriv-api
-websockets==10.3
+websockets
