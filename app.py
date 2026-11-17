@@ -125,79 +125,50 @@ def execute_deriv_trade(direction, lots):
 
     ws_url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
     
-    # Standard Deriv Volatility/Commodities contract details
-    # For XAUUSD, we use a multiplier contract or standard CALL/PUT.
-    # We will use a simple CALL/PUT with a 5-tick duration as a test.
-    trade_request = {
-        "buy": 1,
-        "price": 10.0, # Fixed stake of $10 for testing
-        "parameters": {
-            "amount": 10.0,
-            "basis": "stake",
-            "contract_type": "MULTUP" if direction == "BUY" else "MULTDOWN", # Multiplier for Gold
-            "currency": "USD",
-            "duration": 5,
-            "duration_unit": "t",
-            "symbol": "frxXAUUSD",
-            "multiplier": 100
-        }
-    }
-    
-    # NOTE: Deriv requires symbol 'frxXAUUSD' for standard accounts, but for multipliers it might be 'cryXAUUSD' or similar. 
-    # For a robust test, we will use CALL/PUT on frxXAUUSD.
-    trade_request = {
-        "buy": 1,
-        "price": 100, 
-        "parameters": {
-            "amount": 10, 
-            "basis": "stake", 
-            "contract_type": direction, # CALL or PUT
-            "currency": "USD", 
-            "duration": 5, 
-            "duration_unit": "t", 
-            "symbol": "frxXAUUSD"
-        }
-    }
-    
-    # We map SELL -> PUT, BUY -> CALL
-    trade_request["parameters"]["contract_type"] = "CALL" if direction == "BUY" else "PUT"
-
-    response_data = {"status": "pending", "message": "Connecting to Deriv..."}
-
-    def on_open(ws):
+    try:
+        import websocket
+        ws = websocket.create_connection(ws_url, timeout=15)
+        
+        # 1. Authorize
         ws.send(json.dumps({"authorize": DERIV_TOKEN}))
-        
-    def on_message(ws, message):
-        nonlocal response_data
-        data = json.loads(message)
-        
-        if 'error' in data:
-            response_data = {"status": "error", "message": data['error']['message']}
-            ws.close()
-            return
+        auth_resp = json.loads(ws.recv())
+        if 'error' in auth_resp:
+            return {"status": "error", "message": auth_resp['error']['message']}
             
-        if 'authorize' in data:
-            # Successfully authorized, now send the trade
-            ws.send(json.dumps(trade_request))
-            
-        elif 'buy' in data:
-            # Trade executed successfully!
-            response_data = {
-                "status": "success", 
-                "message": f"EXECUTED: {direction} {lots} Lots",
-                "contract_id": data['buy']['contract_id']
+        # 2. Send Trade (Using CALL/PUT for 5 ticks, $10 stake)
+        trade_request = {
+            "buy": 1,
+            "price": 100, 
+            "parameters": {
+                "amount": 10, 
+                "basis": "stake", 
+                "contract_type": "CALL" if direction == "BUY" else "PUT",
+                "currency": "USD", 
+                "duration": 5, 
+                "duration_unit": "t", 
+                "symbol": "frxXAUUSD"
             }
+        }
+        ws.send(json.dumps(trade_request))
+        trade_resp = json.loads(ws.recv())
+        
+        if 'error' in trade_resp:
+            return {"status": "error", "message": trade_resp['error']['message']}
+            
+        if 'buy' in trade_resp:
             ws.close()
-
-    ws = websocket.WebSocketApp(ws_url, on_open=on_open, on_message=on_message)
-    ws.run_forever()
-    
-    return response_data
+            return {"status": "success", "message": f"EXECUTED: {direction} {lots} Lots", "contract_id": trade_resp['buy']['contract_id']}
+            
+        ws.close()
+        return {"status": "error", "message": "Unknown response from Deriv"}
+        
+    except Exception as e:
+        return {"status": "error", "message": f"Connection error: {str(e)}"}
 
 @app.route('/api/v1/trade', methods=['POST'])
 def trade():
     order_data = request.json
-    direction = order_data.get("direction", "SELL") # BUY or SELL
+    direction = order_data.get("direction", "SELL") 
     lots = order_data.get("lots", 0.10)
     
     print(f"⚡ INITIATING NUCLEAR STRIKE: {direction}")
