@@ -110,7 +110,17 @@ def fetch_deriv_prices():
                     update_sniper_protocol(quote)
                     
         except Exception as e:
-            print(f"WebSocket Error: {e}")
+            print(f"WebSocket Error: {e}. Trying fallback API...")
+            # FALLBACK: If Deriv drops, use gold-api.com to keep UI alive
+            try:
+                res = requests.get("https://api.gold-api.com/price/XAU")
+                quote = float(res.json()['price'])
+                market_state["current_price"] = round(quote, 2)
+                market_state["bid"] = round(quote - 0.08, 2)
+                market_state["ask"] = round(quote + 0.08, 2)
+                market_state["spread"] = 0.16
+            except:
+                pass
             time.sleep(5)
 
 def update_sessions(current_price):
