@@ -139,7 +139,6 @@ async def async_deriv_trade(direction):
             "symbol": "frxXAUUSD"
         })
         
-        # Check for errors in proposal
         if 'error' in proposal:
              return {"status": "error", "message": proposal['error']['message']}
         
