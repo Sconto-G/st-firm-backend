@@ -6,9 +6,9 @@ import time
 import os
 import asyncio
 import json
-import websockets
 from google import genai
 from google.genai import types
+from deriv_sdk import DerivClient
 
 app = Flask(__name__)
 CORS(app)
@@ -121,60 +121,49 @@ def chat():
             continue
     return jsonify({"reply": f"AI Error: {last_error}"}), 500
 
-# --- 3. THE NUCLEAR TRADING ENGINE (Modern WebSockets) ---
+# --- 3. THE NUCLEAR TRADING ENGINE (Official SDK) ---
 async def async_deriv_trade(direction):
-    # Using the modern websockets library with headers to bypass Cloudflare
-    ws_url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
-    
-    # These headers mimic a real browser to prevent Cloudflare from blocking the handshake
-    extra_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Origin": "https://app.deriv.com"
-    }
+    if not DERIV_TOKEN:
+        return {"status": "error", "message": "DERIV_TOKEN missing in environment"}
 
+    # Initialize the official client
+    client = DerivClient(app_id=DERIV_APP_ID, api_token=DERIV_TOKEN)
+    
     try:
-        async with websockets.connect(ws_url, additional_headers=extra_headers, ping_interval=20, ping_timeout=20) as ws:
-            # 1. Authorize
-            await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
-            auth_resp = json.loads(await ws.recv())
-            
-            if 'error' in auth_resp:
-                return {"status": "error", "message": auth_resp['error']['message']}
-            
-            # 2. Proposal
-            proposal_req = {
-                "proposal": 1,
-                "amount": 10,
-                "basis": "stake",
-                "contract_type": "CALL" if direction == "BUY" else "PUT",
-                "currency": "USD",
-                "duration": 5,
-                "duration_unit": "t",
-                "symbol": "frxXAUUSD"
-            }
-            await ws.send(json.dumps(proposal_req))
-            proposal_resp = json.loads(await ws.recv())
-            
-            if 'error' in proposal_resp:
-                return {"status": "error", "message": proposal_resp['error']['message']}
-            
-            proposal_id = proposal_resp['proposal']['id']
-            
-            # 3. Buy
-            buy_req = {"buy": proposal_id, "price": 10}
-            await ws.send(json.dumps(buy_req))
-            buy_resp = json.loads(await ws.recv())
-            
-            if 'error' in buy_resp:
-                return {"status": "error", "message": buy_resp['error']['message']}
-            
-            if 'buy' in buy_resp:
-                return {"status": "success", "message": f"EXECUTED: {direction} 0.10 Lots", "contract_id": buy_resp['buy']['contract_id']}
-                
-            return {"status": "error", "message": "Unknown response from Deriv"}
-            
+        # The SDK handles the connection and authorization internally
+        await client.start()
+        
+        # 1. Proposal
+        proposal = await client.trading.proposal({
+            "amount": 10,
+            "basis": "stake",
+            "contract_type": "CALL" if direction == "BUY" else "PUT",
+            "currency": "USD",
+            "duration": 5,
+            "duration_unit": "t",
+            "symbol": "frxXAUUSD"
+        })
+        
+        if 'error' in proposal:
+             return {"status": "error", "message": proposal['error']['message']}
+        
+        proposal_id = proposal['proposal']['id']
+        
+        # 2. Buy
+        buy = await client.trading.buy({
+            "buy": proposal_id,
+            "price": 10
+        })
+        
+        if 'error' in buy:
+             return {"status": "error", "message": buy['error']['message']}
+
+        return {"status": "success", "message": f"EXECUTED: {direction} 0.10 Lots", "contract_id": buy['buy']['contract_id']}
+        
     except Exception as e:
-        return {"status": "error", "message": f"Connection error: {str(e)}"}
+        return {"status": "error", "message": f"Deriv SDK Error: {str(e)}"}
+    finally:
+        await client.close()
 
 @app.route('/api/v1/trade', methods=['POST'])
 def trade():
@@ -183,9 +172,8 @@ def trade():
     lots = order_data.get("lots", 0.10)
     
     print(f"⚡ INITIATING NUCLEAR STRIKE: {direction}")
-    if not DERIV_TOKEN:
-        return jsonify({"status": "error", "message": "DERIV_TOKEN missing in Render environment"})
     
+    # Run the async function and return the result
     result = asyncio.run(async_deriv_trade(direction))
     return jsonify(result)
 
