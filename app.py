@@ -98,11 +98,23 @@ def fetch_gold_price():
                     market_state["timeframes"][tf] = {"trend": trend, "bias": bias}
                 
                 if bias == "BULLISH":
-                    market_state["market_posture"] = "BUY"
-                    market_state["confidence"] = 85 
-                else:
-                    market_state["market_posture"] = "SELL"
-                    market_state["confidence"] = 85
+    market_state["market_posture"] = "BUY"
+    market_state["confidence"] = 85 
+else:
+    market_state["market_posture"] = "SELL"
+    market_state["confidence"] = 85
+
+# --- AUTO-PILOT LOGIC ---
+# If confidence is high and posture flips, execute the trade!
+if market_state["market_posture"] != last_posture and market_state["confidence"] >= 85:
+    print(f"🤖 AUTOPILOT EXECUTING: {market_state['market_posture']}")
+    
+    # We run the async trade function
+    try:
+        asyncio.run(async_deriv_trade(market_state["market_posture"]))
+        send_telegram_alert(f"🤖 *AUTOPILOT EXECUTED*\nFired: {market_state['market_posture']}\nPrice: {market_state['current_price']}")
+    except Exception as e:
+        print(f"Autopilot failed: {e}")
                 
                 # CHECK FOR TELEGRAM ALERT (Posture Change)
                 if market_state["market_posture"] != last_posture:
