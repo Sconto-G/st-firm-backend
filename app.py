@@ -98,30 +98,31 @@ def fetch_gold_price():
                     market_state["timeframes"][tf] = {"trend": trend, "bias": bias}
                 
                 if bias == "BULLISH":
-    market_state["market_posture"] = "BUY"
-    market_state["confidence"] = 85 
-else:
-    market_state["market_posture"] = "SELL"
-    market_state["confidence"] = 85
-
-# --- AUTO-PILOT LOGIC ---
-# If confidence is high and posture flips, execute the trade!
-if market_state["market_posture"] != last_posture and market_state["confidence"] >= 85:
-    print(f"🤖 AUTOPILOT EXECUTING: {market_state['market_posture']}")
-    
-    # We run the async trade function
-    try:
-        asyncio.run(async_deriv_trade(market_state["market_posture"]))
-        send_telegram_alert(f"🤖 *AUTOPILOT EXECUTED*\nFired: {market_state['market_posture']}\nPrice: {market_state['current_price']}")
-    except Exception as e:
-        print(f"Autopilot failed: {e}")
+                    market_state["market_posture"] = "BUY"
+                    market_state["confidence"] = 85 
+                else:
+                    market_state["market_posture"] = "SELL"
+                    market_state["confidence"] = 85
                 
-                # CHECK FOR TELEGRAM ALERT (Posture Change)
+                # --- AUTO-PILOT & TELEGRAM LOGIC ---
+                # If posture flips, alert and fire the missile!
                 if market_state["market_posture"] != last_posture:
-                    last_posture = market_state["market_posture"]
-                    alert_msg = f"🚨 *ST-FIRM ALERT*\n\nPosture flipped to: *{last_posture}*\nConfidence: {market_state['confidence']}%\nPrice: {market_state['current_price']}"
+                    
+                    # 1. Send Telegram Alert
+                    alert_msg = f"🚨 *ST-FIRM ALERT*\n\nPosture flipped to: *{market_state['market_posture']}*\nConfidence: {market_state['confidence']}%\nPrice: {market_state['current_price']}"
                     send_telegram_alert(alert_msg)
                     
+                    # 2. Auto-Pilot Execution
+                    print(f"🤖 AUTOPILOT EXECUTING: {market_state['market_posture']}")
+                    try:
+                        asyncio.run(async_deriv_trade(market_state["market_posture"]))
+                        send_telegram_alert(f"🤖 *AUTOPILOT EXECUTED*\nFired: {market_state['market_posture']}")
+                    except Exception as e:
+                        print(f"Autopilot failed: {e}")
+                        
+                    # Update the last posture so it doesn't fire every 5 seconds
+                    last_posture = market_state["market_posture"]
+                        
         except Exception as e:
             print(f"Error fetching data: {e}")
         
