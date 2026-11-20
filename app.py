@@ -85,6 +85,14 @@ def fetch_gold_price():
             response = requests.get("https://api.gold-api.com/price/XAU", timeout=10)
             data = response.json()
             live_price = float(data['price'])
+
+            # Calculate Market Velocity (Bloodlust)
+velocity = 0
+if len(price_history) > 1:
+    velocity = abs(live_price - price_history[-1]) * 100 
+
+# Normalize to a 0-100 scale (Cap at 100)
+market_state["bloodlust"] = min(int(velocity * 10), 100)
             
             market_state["current_price"] = str(round(live_price, 2))
             price_history.append(live_price)
