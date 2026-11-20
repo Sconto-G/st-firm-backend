@@ -85,6 +85,10 @@ def fetch_gold_price():
             response = requests.get("https://api.gold-api.com/price/XAU", timeout=10)
             data = response.json()
             live_price = float(data['price'])
+        except Exception as e:
+            print(f"Price fetch error: {e}")
+            time.sleep(5)
+            continue
 
             # Calculate Market Velocity (Bloodlust)
 velocity = 0
