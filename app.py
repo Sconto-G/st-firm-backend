@@ -237,6 +237,48 @@ def trade():
     
     result = asyncio.run(async_deriv_trade(direction))
     return jsonify(result)
+    CAMPAIGN_LOG = []
+
+@app.route('/api/v1/campaign/action', methods=['POST', 'GET'])
+def campaign_action():
+    if request.method == 'GET':
+        return jsonify({
+            "status": "ok",
+            "recent_actions": CAMPAIGN_LOG[-20:]
+        }), 200
+
+    data = request.get_json(silent=True) or {}
+    action = str(data.get("action", "")).strip().upper()
+    price = data.get("price")
+    lots = data.get("lots")
+    timestamp = data.get("timestamp") or time.strftime("%Y-%m-%d %H:%M:%S EAT", time.gmtime(time.time() + 3 * 3600))
+
+    allowed_actions = {"ARM_SNIPER", "BANK_75", "FLATTEN_ALL", "SNIPE_RECLAIM"}
+    if action not in allowed_actions:
+        return jsonify({
+            "status": "error",
+            "message": f"Unsupported action: {action}"
+        }), 400
+
+    event = {
+        "action": action,
+        "price": price,
+        "lots": lots,
+        "timestamp": timestamp
+    }
+    CAMPAIGN_LOG.append(event)
+    if len(CAMPAIGN_LOG) > 100:
+        CAMPAIGN_LOG.pop(0)
+
+    send_telegram_alert(
+        f"*ST-FIRM CAMPAIGN ACTION*\nAction: `{action}`\nPrice: `{price}`\nLots: `{lots}`\nTime: `{timestamp}`"
+    )
+
+    return jsonify({
+        "status": "accepted",
+        "event": event
+    }), 200
+
 
 if __name__ == '__main__':
     thread = threading.Thread(target=fetch_gold_price)
