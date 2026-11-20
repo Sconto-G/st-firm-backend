@@ -98,8 +98,8 @@ if len(price_history) > 1:
 # Normalize to a 0-100 scale (Cap at 100)
 market_state["bloodlust"] = min(int(velocity * 10), 100)
             
-            market_state["current_price"] = str(round(live_price, 2))
-            price_history.append(live_price)
+market_state["current_price"] = str(round(live_price, 2))
+price_history.append(live_price)
             
             if len(price_history) > 50:
                 price_history.pop(0)
