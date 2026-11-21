@@ -90,11 +90,11 @@ def fetch_gold_price():
             time.sleep(5)
             continue
 
-            # Calculate Market Velocity (Bloodlust)
-                    velocity = 0
+                  # Calculate Market Velocity (Bloodlust)
+        velocity = 0
         if len(price_history) > 1:
             velocity = abs(live_price - price_history[-1]) * 100
-
+  
         # Normalize to a 0-100 scale (Cap at 100)
         market_state["bloodlust"] = min(int(velocity * 10), 100)
 
