@@ -9,6 +9,8 @@ import json
 import websockets
 from google import genai
 from google.genai import types
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 CORS(app)
@@ -43,25 +45,12 @@ market_state = {
     },
     "confidence": 0,
     "market_posture": "WAITING",
-    "status": "success",
-    "institutional_hud": {
-        "weekly_open": "2410.50",
-        "weekly_bias_text": "-1.07% RED BIAS",
-        "pdh_price": "2415.80",
-        "pdh_status": "SWEPT ✓",
-        "pdh_subtext": "BUY-STOPS PURGED",
-        "pdl_price": "2378.20",
-        "pdl_badge": "MAGNET",
-        "pdl_subtext": "RUN EXPECTED D1",
-        "fuel_pct": 78,
-        "fuel_label": "78% USED",
-        "fuel_pips_text": "142 / 182 PIPS EXP"
-    }
-
+    "bloodlust": 0,
+    "status": "success"
 }
 
 price_history = []
-last_posture = "WAITING" # For Telegram alerts
+last_posture = "WAITING" 
 
 # --- TELEGRAM ALERT ENGINE ---
 def send_telegram_alert(message):
@@ -70,17 +59,13 @@ def send_telegram_alert(message):
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID, 
-            "text": message, 
-            "parse_mode": "Markdown"
-        }
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
         requests.post(url, json=payload, timeout=5)
         print("Telegram alert sent!")
     except Exception as e:
         print(f"Telegram Error: {e}")
 
-# --- 1. LIVE PRICE & TREND ENGINE ---
+# --- 1. LIVE PRICE, BLOODLUST & AUTOPILOT ENGINE ---
 def calculate_trend(prices):
     if len(prices) < 10:
         return "WAITING", "WAITING"
@@ -99,55 +84,50 @@ def fetch_gold_price():
             response = requests.get("https://api.gold-api.com/price/XAU", timeout=10)
             data = response.json()
             live_price = float(data['price'])
-        except Exception as e:
-            print(f"Price fetch error: {e}")
-            time.sleep(5)
-            continue
+            
+            # Calculate Market Velocity (Bloodlust)
+            velocity = 0
+            if len(price_history) > 1:
+                velocity = abs(live_price - price_history[-1]) * 100 
+            
+            # Normalize to a 0-100 scale
+            market_state["bloodlust"] = min(int(velocity * 10), 100)
 
-                  # Calculate Market Velocity (Bloodlust)
-        velocity = 0
-        if len(price_history) > 1:
-            velocity = abs(live_price - price_history[-1]) * 100
-  
-        # Normalize to a 0-100 scale (Cap at 100)
-        market_state["bloodlust"] = min(int(velocity * 10), 100)
-
-        market_state["current_price"] = str(round(live_price, 2))
-        price_history.append(live_price)
-
-        if len(price_history) > 50:
-            price_history.pop(0)
-
-        if len(price_history) > 5:
-            trend, bias = calculate_trend(price_history)
-            for tf in ["M5", "M30", "H1", "H4", "D1"]:
-                market_state["timeframes"][tf] = {"trend": trend, "bias": bias}
-
-            if bias == "BULLISH":
-                market_state["market_posture"] = "BUY"
-                market_state["confidence"] = 85
-            else:
-                market_state["market_posture"] = "SELL"
-                market_state["confidence"] = 85
-
+            market_state["current_price"] = str(round(live_price, 2))
+            price_history.append(live_price)
+            
+            if len(price_history) > 50:
+                price_history.pop(0)
+            
+            if len(price_history) > 5:
+                trend, bias = calculate_trend(price_history)
+                for tf in ["M5", "M30", "H1", "H4", "D1"]:
+                    market_state["timeframes"][tf] = {"trend": trend, "bias": bias}
+                
+                if bias == "BULLISH":
+                    market_state["market_posture"] = "BUY"
+                    market_state["confidence"] = 85 
+                else:
+                    market_state["market_posture"] = "SELL"
+                    market_state["confidence"] = 85
+                
                 # --- AUTO-PILOT & TELEGRAM LOGIC ---
-                # If posture flips, alert and fire the missile!
-        if market_state["market_posture"] != last_posture:
-            # 1. Send Telegram Alert
-            alert_msg = f"🚨 *ST-FIRM ALERT*\n\nPosture flipped to: *{market_state['market_posture']}*\nConfidence: {market_state['confidence']}%\nPrice: {market_state['current_price']}"
-            send_telegram_alert(alert_msg)
-
-            # 2. Auto-Pilot Execution
-            print(f"🤖 AUTOPILOT EXECUTING: {market_state['market_posture']}")
-            try:
-                asyncio.run(async_deriv_trade(market_state["market_posture"]))
-                send_telegram_alert(f"🤖 *AUTOPILOT EXECUTED*\nFired: {market_state['market_posture']}")
-            except Exception as e:
-                print(f"Autopilot failed: {e}")
-
-            # Update the last posture so it doesn't fire every 5 seconds
-            last_posture = market_state["market_posture"]
-
+                if market_state["market_posture"] != last_posture:
+                    alert_msg = f"🚨 *ST-FIRM ALERT*\n\nPosture flipped to: *{market_state['market_posture']}*\nConfidence: {market_state['confidence']}%\nPrice: {market_state['current_price']}"
+                    send_telegram_alert(alert_msg)
+                    
+                    print(f"🤖 AUTOPILOT EXECUTING: {market_state['market_posture']}")
+                    try:
+                        asyncio.run(async_deriv_trade(market_state["market_posture"]))
+                        send_telegram_alert(f"🤖 *AUTOPILOT EXECUTED*\nFired: {market_state['market_posture']}")
+                    except Exception as e:
+                        print(f"Autopilot failed: {e}")
+                        
+                    last_posture = market_state["market_posture"]
+                        
+        except Exception as e:
+            print(f"Error fetching data: {e}")
+        
         time.sleep(5)
 
 @app.route('/api/v1/market/xauusd')
@@ -189,31 +169,23 @@ def chat():
 async def async_deriv_trade(direction):
     ws_url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
     
-    # These headers mimic a real browser to prevent Cloudflare from blocking the handshake
     extra_headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Origin": "https://app.deriv.com"
     }
 
     try:
-        # Using the modern websockets library with the 'additional_headers' fix
         async with websockets.connect(ws_url, additional_headers=extra_headers, ping_interval=20, ping_timeout=20) as ws:
-            # 1. Authorize
             await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
             auth_resp = json.loads(await ws.recv())
             
             if 'error' in auth_resp:
                 return {"status": "error", "message": auth_resp['error']['message']}
             
-            # 2. Proposal
             proposal_req = {
-                "proposal": 1,
-                "amount": 10,
-                "basis": "stake",
+                "proposal": 1, "amount": 10, "basis": "stake",
                 "contract_type": "CALL" if direction == "BUY" else "PUT",
-                "currency": "USD",
-                "duration": 5,
-                "duration_unit": "t",
+                "currency": "USD", "duration": 5, "duration_unit": "t",
                 "symbol": "frxXAUUSD"
             }
             await ws.send(json.dumps(proposal_req))
@@ -224,7 +196,6 @@ async def async_deriv_trade(direction):
             
             proposal_id = proposal_resp['proposal']['id']
             
-            # 3. Buy
             buy_req = {"buy": proposal_id, "price": 10}
             await ws.send(json.dumps(buy_req))
             buy_resp = json.loads(await ws.recv())
@@ -251,48 +222,59 @@ def trade():
     
     result = asyncio.run(async_deriv_trade(direction))
     return jsonify(result)
-    CAMPAIGN_LOG = []
 
-@app.route('/api/v1/campaign/action', methods=['POST', 'GET'])
-def campaign_action():
-    if request.method == 'GET':
-        return jsonify({
-            "status": "ok",
-            "recent_actions": CAMPAIGN_LOG[-20:]
-        }), 200
+# --- 4. LIVE FOREX FACTORY NEWS ENGINE ---
+@app.route('/api/v1/news/calendar')
+def get_economic_calendar():
+    try:
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        if response.status_code != 200:
+            return jsonify({"status": "error", "message": "Failed to fetch news feed"}), 500
 
-    data = request.get_json(silent=True) or {}
-    action = str(data.get("action", "")).strip().upper()
-    price = data.get("price")
-    lots = data.get("lots")
-    timestamp = data.get("timestamp") or time.strftime("%Y-%m-%d %H:%M:%S EAT", time.gmtime(time.time() + 3 * 3600))
+        root = ET.fromstring(response.content)
+        news_events = []
+        
+        now_utc = datetime.utcnow()
+        ny_offset = -4 if 3 < now_utc.month < 11 else -5
+        
+        for event in root.findall('event'):
+            try:
+                impact = event.find('impact').text
+                if impact not in ["High", "Medium"]:
+                    continue
 
-    allowed_actions = {"ARM_SNIPER", "BANK_75", "FLATTEN_ALL", "SNIPE_RECLAIM"}
-    if action not in allowed_actions:
-        return jsonify({
-            "status": "error",
-            "message": f"Unsupported action: {action}"
-        }), 400
+                date_str = event.find('date').text
+                time_str = event.find('time').text
+                
+                if not time_str or "day" in time_str.lower() or ":" not in time_str:
+                    continue
 
-    event = {
-        "action": action,
-        "price": price,
-        "lots": lots,
-        "timestamp": timestamp
-    }
-    CAMPAIGN_LOG.append(event)
-    if len(CAMPAIGN_LOG) > 100:
-        CAMPAIGN_LOG.pop(0)
+                event_dt_str = f"{date_str} {time_str}"
+                event_ny = datetime.strptime(event_dt_str, "%m-%d-%Y %I:%M%p")
+                event_utc = event_ny - timedelta(hours=ny_offset)
+                event_eat = event_utc + timedelta(hours=3)
 
-    send_telegram_alert(
-        f"*ST-FIRM CAMPAIGN ACTION*\nAction: `{action}`\nPrice: `{price}`\nLots: `{lots}`\nTime: `{timestamp}`"
-    )
+                if event_eat < (now_utc + timedelta(hours=3) - timedelta(minutes=5)):
+                    continue
 
-    return jsonify({
-        "status": "accepted",
-        "event": event
-    }), 200
+                news_events.append({
+                    "title": event.find('title').text,
+                    "country": event.find('country').text,
+                    "time": event_eat.strftime("%H:%M"),
+                    "impact": impact,
+                    "timestamp": event_eat.timestamp()
+                })
+            except Exception as e:
+                continue 
 
+        news_events.sort(key=lambda x: x["timestamp"])
+        return jsonify({"status": "success", "news": news_events})
+        
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == '__main__':
     thread = threading.Thread(target=fetch_gold_price)
