@@ -119,7 +119,6 @@ def fetch_gold_price():
                 # --- AUTO-PILOT & TELEGRAM LOGIC ---
                 # If posture flips, alert and fire the missile!
         if market_state["market_posture"] != last_posture:
-
             # 1. Send Telegram Alert
             alert_msg = f"🚨 *ST-FIRM ALERT*\n\nPosture flipped to: *{market_state['market_posture']}*\nConfidence: {market_state['confidence']}%\nPrice: {market_state['current_price']}"
             send_telegram_alert(alert_msg)
@@ -135,10 +134,10 @@ def fetch_gold_price():
             # Update the last posture so it doesn't fire every 5 seconds
             last_posture = market_state["market_posture"]
 
-    except Exception as e:
+        except Exception as e:
             print(f"Error fetching data: {e}")
 
-    time.sleep(5)
+        time.sleep(5)
 
 @app.route('/api/v1/market/xauusd')
 def get_market_data():
