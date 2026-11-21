@@ -43,7 +43,21 @@ market_state = {
     },
     "confidence": 0,
     "market_posture": "WAITING",
-    "status": "success"
+    "status": "success",
+    "institutional_hud": {
+        "weekly_open": "2410.50",
+        "weekly_bias_text": "-1.07% RED BIAS",
+        "pdh_price": "2415.80",
+        "pdh_status": "SWEPT ✓",
+        "pdh_subtext": "BUY-STOPS PURGED",
+        "pdl_price": "2378.20",
+        "pdl_badge": "MAGNET",
+        "pdl_subtext": "RUN EXPECTED D1",
+        "fuel_pct": 78,
+        "fuel_label": "78% USED",
+        "fuel_pips_text": "142 / 182 PIPS EXP"
+    }
+
 }
 
 price_history = []
