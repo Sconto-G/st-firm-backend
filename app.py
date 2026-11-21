@@ -118,27 +118,27 @@ def fetch_gold_price():
 
                 # --- AUTO-PILOT & TELEGRAM LOGIC ---
                 # If posture flips, alert and fire the missile!
-                if market_state["market_posture"] != last_posture:
-                    
-                    # 1. Send Telegram Alert
-                    alert_msg = f"🚨 *ST-FIRM ALERT*\n\nPosture flipped to: *{market_state['market_posture']}*\nConfidence: {market_state['confidence']}%\nPrice: {market_state['current_price']}"
-                    send_telegram_alert(alert_msg)
-                    
-                    # 2. Auto-Pilot Execution
-                    print(f"🤖 AUTOPILOT EXECUTING: {market_state['market_posture']}")
-                    try:
-                        asyncio.run(async_deriv_trade(market_state["market_posture"]))
-                        send_telegram_alert(f"🤖 *AUTOPILOT EXECUTED*\nFired: {market_state['market_posture']}")
-                    except Exception as e:
-                        print(f"Autopilot failed: {e}")
-                        
-                    # Update the last posture so it doesn't fire every 5 seconds
-                    last_posture = market_state["market_posture"]
-                        
-                  except Exception as e:
+        if market_state["market_posture"] != last_posture:
+
+            # 1. Send Telegram Alert
+            alert_msg = f"🚨 *ST-FIRM ALERT*\n\nPosture flipped to: *{market_state['market_posture']}*\nConfidence: {market_state['confidence']}%\nPrice: {market_state['current_price']}"
+            send_telegram_alert(alert_msg)
+
+            # 2. Auto-Pilot Execution
+            print(f"🤖 AUTOPILOT EXECUTING: {market_state['market_posture']}")
+            try:
+                asyncio.run(async_deriv_trade(market_state["market_posture"]))
+                send_telegram_alert(f"🤖 *AUTOPILOT EXECUTED*\nFired: {market_state['market_posture']}")
+            except Exception as e:
+                print(f"Autopilot failed: {e}")
+
+            # Update the last posture so it doesn't fire every 5 seconds
+            last_posture = market_state["market_posture"]
+
+        except Exception as e:
             print(f"Error fetching data: {e}")
-        
-                 time.sleep(5)
+
+        time.sleep(5)
 
 @app.route('/api/v1/market/xauusd')
 def get_market_data():
