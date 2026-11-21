@@ -91,31 +91,31 @@ def fetch_gold_price():
             continue
 
             # Calculate Market Velocity (Bloodlust)
-velocity = 0
-if len(price_history) > 1:
-    velocity = abs(live_price - price_history[-1]) * 100 
+                    velocity = 0
+        if len(price_history) > 1:
+            velocity = abs(live_price - price_history[-1]) * 100
 
-# Normalize to a 0-100 scale (Cap at 100)
-market_state["bloodlust"] = min(int(velocity * 10), 100)
-            
-market_state["current_price"] = str(round(live_price, 2))
-price_history.append(live_price)
-            
-            if len(price_history) > 50:
-                price_history.pop(0)
-            
-            if len(price_history) > 5:
-                trend, bias = calculate_trend(price_history)
-                for tf in ["M5", "M30", "H1", "H4", "D1"]:
-                    market_state["timeframes"][tf] = {"trend": trend, "bias": bias}
-                
-                if bias == "BULLISH":
-                    market_state["market_posture"] = "BUY"
-                    market_state["confidence"] = 85 
-                else:
-                    market_state["market_posture"] = "SELL"
-                    market_state["confidence"] = 85
-                
+        # Normalize to a 0-100 scale (Cap at 100)
+        market_state["bloodlust"] = min(int(velocity * 10), 100)
+
+        market_state["current_price"] = str(round(live_price, 2))
+        price_history.append(live_price)
+
+        if len(price_history) > 50:
+            price_history.pop(0)
+
+        if len(price_history) > 5:
+            trend, bias = calculate_trend(price_history)
+            for tf in ["M5", "M30", "H1", "H4", "D1"]:
+                market_state["timeframes"][tf] = {"trend": trend, "bias": bias}
+
+            if bias == "BULLISH":
+                market_state["market_posture"] = "BUY"
+                market_state["confidence"] = 85
+            else:
+                market_state["market_posture"] = "SELL"
+                market_state["confidence"] = 85
+
                 # --- AUTO-PILOT & TELEGRAM LOGIC ---
                 # If posture flips, alert and fire the missile!
                 if market_state["market_posture"] != last_posture:
