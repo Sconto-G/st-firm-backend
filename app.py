@@ -134,7 +134,7 @@ def fetch_gold_price():
             # Update the last posture so it doesn't fire every 5 seconds
             last_posture = market_state["market_posture"]
 
-      except Exception as e:
+       except Exception as e:
             print(f"Error fetching data: {e}")
 
     time.sleep(5)
