@@ -1,6 +1,5 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import requests
 import threading
 import time
 import os
@@ -35,7 +34,7 @@ else:
 MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
 
 market_state = {
-    "current_price": "4586.11",
+    "current_price": "3525.78", # Hardcoded to Friday close until market opens
     "timeframes": {
         "M5": {"trend": "WAITING", "bias": "WAITING"},
         "M30": {"trend": "WAITING", "bias": "WAITING"},
@@ -58,6 +57,7 @@ def send_telegram_alert(message):
         print("Telegram keys missing. Skipping alert.")
         return
     try:
+        import requests # Imported here to avoid global scope issues
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
         requests.post(url, json=payload, timeout=5)
@@ -65,7 +65,7 @@ def send_telegram_alert(message):
     except Exception as e:
         print(f"Telegram Error: {e}")
 
-# --- 1. LIVE PRICE, BLOODLUST & AUTOPILOT ENGINE ---
+# --- 1. LIVE DERIV WEBSOCKET STREAM & AUTOPILOT ---
 def calculate_trend(prices):
     if len(prices) < 10:
         return "WAITING", "WAITING"
@@ -77,58 +77,71 @@ def calculate_trend(prices):
         return "DOWNTREND", "BEARISH"
     return "WAITING", "WAITING"
 
-def fetch_gold_price():
+async def stream_deriv_ticks():
     global last_posture
+    ws_url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+    
+    extra_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+
     while True:
         try:
-            response = requests.get("https://api.gold-api.com/price/XAU", timeout=10)
-            data = response.json()
-            live_price = float(data['price'])
-            
-            # Calculate Market Velocity (Bloodlust)
-            velocity = 0
-            if len(price_history) > 1:
-                velocity = abs(live_price - price_history[-1]) * 100 
-            
-            # Normalize to a 0-100 scale
-            market_state["bloodlust"] = min(int(velocity * 10), 100)
-
-            market_state["current_price"] = str(round(live_price, 2))
-            price_history.append(live_price)
-            
-            if len(price_history) > 50:
-                price_history.pop(0)
-            
-            if len(price_history) > 5:
-                trend, bias = calculate_trend(price_history)
-                for tf in ["M5", "M30", "H1", "H4", "D1"]:
-                    market_state["timeframes"][tf] = {"trend": trend, "bias": bias}
+            async with websockets.connect(ws_url, additional_headers=extra_headers) as ws:
+                # Subscribe to live XAUUSD ticks
+                await ws.send(json.dumps({"ticks": "frxXAUUSD", "subscribe": 1}))
                 
-                if bias == "BULLISH":
-                    market_state["market_posture"] = "BUY"
-                    market_state["confidence"] = 85 
-                else:
-                    market_state["market_posture"] = "SELL"
-                    market_state["confidence"] = 85
-                
-                # --- AUTO-PILOT & TELEGRAM LOGIC ---
-                if market_state["market_posture"] != last_posture:
-                    alert_msg = f"🚨 *ST-FIRM ALERT*\n\nPosture flipped to: *{market_state['market_posture']}*\nConfidence: {market_state['confidence']}%\nPrice: {market_state['current_price']}"
-                    send_telegram_alert(alert_msg)
+                while True:
+                    response = await ws.recv()
+                    data = json.loads(response)
                     
-                    print(f"🤖 AUTOPILOT EXECUTING: {market_state['market_posture']}")
-                    try:
-                        asyncio.run(async_deriv_trade(market_state["market_posture"]))
-                        send_telegram_alert(f"🤖 *AUTOPILOT EXECUTED*\nFired: {market_state['market_posture']}")
-                    except Exception as e:
-                        print(f"Autopilot failed: {e}")
+                    if 'tick' in data:
+                        live_price = float(data['tick']['quote'])
                         
-                    last_posture = market_state["market_posture"]
+                        # Bloodlust Calculation (Velocity)
+                        velocity = 0
+                        if len(price_history) > 0:
+                            velocity = abs(live_price - price_history[-1]) * 100
+                        market_state["bloodlust"] = min(int(velocity * 10), 100)
                         
+                        market_state["current_price"] = str(round(live_price, 2))
+                        price_history.append(live_price)
+                        
+                        if len(price_history) > 50:
+                            price_history.pop(0)
+                        
+                        if len(price_history) > 5:
+                            trend, bias = calculate_trend(price_history)
+                            for tf in ["M5", "M30", "H1", "H4", "D1"]:
+                                market_state["timeframes"][tf] = {"trend": trend, "bias": bias}
+                            
+                            if bias == "BULLISH":
+                                market_state["market_posture"] = "BUY"
+                                market_state["confidence"] = 85 
+                            else:
+                                market_state["market_posture"] = "SELL"
+                                market_state["confidence"] = 85
+                            
+                            # --- AUTO-PILOT & TELEGRAM LOGIC ---
+                            if market_state["market_posture"] != last_posture:
+                                alert_msg = f"🚨 *ST-FIRM ALERT*\n\nPosture flipped to: *{market_state['market_posture']}*\nPrice: {market_state['current_price']}"
+                                send_telegram_alert(alert_msg)
+                                
+                                print(f"🤖 AUTOPILOT EXECUTING: {market_state['market_posture']}")
+                                try:
+                                    asyncio.create_task(async_deriv_trade(market_state["market_posture"]))
+                                    send_telegram_alert(f"🤖 *AUTOPILOT EXECUTED*\nFired: {market_state['market_posture']}")
+                                except Exception as e:
+                                    print(f"Autopilot failed: {e}")
+                                    
+                                last_posture = market_state["market_posture"]
+                                
         except Exception as e:
-            print(f"Error fetching data: {e}")
-        
-        time.sleep(5)
+            print(f"Deriv Stream Error: {e}. Reconnecting in 5s...")
+            await asyncio.sleep(5)
+
+def start_deriv_stream():
+    asyncio.run(stream_deriv_ticks())
 
 @app.route('/api/v1/market/xauusd')
 def get_market_data():
@@ -175,7 +188,7 @@ async def async_deriv_trade(direction):
     }
 
     try:
-        async with websockets.connect(ws_url, additional_headers=extra_headers, ping_interval=20, ping_timeout=20) as ws:
+        async with websockets.connect(ws_url, additional_headers=extra_headers) as ws:
             await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
             auth_resp = json.loads(await ws.recv())
             
@@ -183,9 +196,9 @@ async def async_deriv_trade(direction):
                 return {"status": "error", "message": auth_resp['error']['message']}
             
             proposal_req = {
-                "proposal": 1, "amount": 10, "basis": "stake",
+                "proposal": 1, "amount": 1, "basis": "stake",
                 "contract_type": "CALL" if direction == "BUY" else "PUT",
-                "currency": "USD", "duration": 5, "duration_unit": "t",
+                "currency": "USD", "duration": 1, "duration_unit": "m",
                 "symbol": "frxXAUUSD"
             }
             await ws.send(json.dumps(proposal_req))
@@ -196,7 +209,7 @@ async def async_deriv_trade(direction):
             
             proposal_id = proposal_resp['proposal']['id']
             
-            buy_req = {"buy": proposal_id, "price": 10}
+            buy_req = {"buy": proposal_id, "price": 1}
             await ws.send(json.dumps(buy_req))
             buy_resp = json.loads(await ws.recv())
             
@@ -227,8 +240,9 @@ def trade():
 @app.route('/api/v1/news/calendar')
 def get_economic_calendar():
     try:
+        import requests
         url = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        headers = {"User-Agent": "Mozilla/5.0"}
         response = requests.get(url, headers=headers, timeout=10)
         
         if response.status_code != 200:
@@ -267,7 +281,7 @@ def get_economic_calendar():
                     "impact": impact,
                     "timestamp": event_eat.timestamp()
                 })
-            except Exception as e:
+            except Exception:
                 continue 
 
         news_events.sort(key=lambda x: x["timestamp"])
@@ -277,7 +291,9 @@ def get_economic_calendar():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == '__main__':
-    thread = threading.Thread(target=fetch_gold_price)
-    thread.daemon = True
-    thread.start()
+    # Start the real-time Deriv WebSocket stream in a background thread
+    deriv_thread = threading.Thread(target=start_deriv_stream)
+    deriv_thread.daemon = True
+    deriv_thread.start()
+    
     app.run(host='0.0.0.0', port=10000)
