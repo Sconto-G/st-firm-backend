@@ -10,6 +10,7 @@ from google import genai
 from google.genai import types
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
+import requests
 
 app = Flask(__name__)
 CORS(app)
@@ -19,7 +20,6 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 DERIV_TOKEN = os.environ.get("DERIV_TOKEN")
 DERIV_APP_ID = "1089"
 
-# TELEGRAM CONFIGURATION
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
@@ -34,7 +34,7 @@ else:
 MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
 
 market_state = {
-    "current_price": "3525.78", # Hardcoded to Friday close until market opens
+    "current_price": "3525.78",
     "timeframes": {
         "M5": {"trend": "WAITING", "bias": "WAITING"},
         "M30": {"trend": "WAITING", "bias": "WAITING"},
@@ -45,7 +45,14 @@ market_state = {
     "confidence": 0,
     "market_posture": "WAITING",
     "bloodlust": 0,
-    "status": "success"
+    "status": "success",
+    "strategy": {
+        "target_level": 0.0,
+        "target_name": "WAITING",
+        "distance_pips": 0.0,
+        "playbook_state": "WAITING FOR SETUP",
+        "playbook_confidence": 0
+    }
 }
 
 price_history = []
@@ -54,18 +61,15 @@ last_posture = "WAITING"
 # --- TELEGRAM ALERT ENGINE ---
 def send_telegram_alert(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram keys missing. Skipping alert.")
         return
     try:
-        import requests # Imported here to avoid global scope issues
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
         requests.post(url, json=payload, timeout=5)
-        print("Telegram alert sent!")
     except Exception as e:
         print(f"Telegram Error: {e}")
 
-# --- 1. LIVE DERIV WEBSOCKET STREAM & AUTOPILOT ---
+# --- 1. LIVE DERIV WEBSOCKET STREAM & STRATEGY ENGINE ---
 def calculate_trend(prices):
     if len(prices) < 10:
         return "WAITING", "WAITING"
@@ -88,7 +92,6 @@ async def stream_deriv_ticks():
     while True:
         try:
             async with websockets.connect(ws_url, additional_headers=extra_headers) as ws:
-                # Subscribe to live XAUUSD ticks
                 await ws.send(json.dumps({"ticks": "frxXAUUSD", "subscribe": 1}))
                 
                 while True:
@@ -98,18 +101,20 @@ async def stream_deriv_ticks():
                     if 'tick' in data:
                         live_price = float(data['tick']['quote'])
                         
-                        # Bloodlust Calculation (Velocity)
+                        # 1. Bloodlust Calculation
                         velocity = 0
                         if len(price_history) > 0:
                             velocity = abs(live_price - price_history[-1]) * 100
                         market_state["bloodlust"] = min(int(velocity * 10), 100)
                         
+                        # 2. Update Price
                         market_state["current_price"] = str(round(live_price, 2))
                         price_history.append(live_price)
                         
                         if len(price_history) > 50:
                             price_history.pop(0)
                         
+                        # 3. Trend & Auto-Pilot
                         if len(price_history) > 5:
                             trend, bias = calculate_trend(price_history)
                             for tf in ["M5", "M30", "H1", "H4", "D1"]:
@@ -122,19 +127,52 @@ async def stream_deriv_ticks():
                                 market_state["market_posture"] = "SELL"
                                 market_state["confidence"] = 85
                             
-                            # --- AUTO-PILOT & TELEGRAM LOGIC ---
                             if market_state["market_posture"] != last_posture:
                                 alert_msg = f"🚨 *ST-FIRM ALERT*\n\nPosture flipped to: *{market_state['market_posture']}*\nPrice: {market_state['current_price']}"
                                 send_telegram_alert(alert_msg)
-                                
-                                print(f"🤖 AUTOPILOT EXECUTING: {market_state['market_posture']}")
-                                try:
-                                    asyncio.create_task(async_deriv_trade(market_state["market_posture"]))
-                                    send_telegram_alert(f"🤖 *AUTOPILOT EXECUTED*\nFired: {market_state['market_posture']}")
-                                except Exception as e:
-                                    print(f"Autopilot failed: {e}")
-                                    
                                 last_posture = market_state["market_posture"]
+
+                        # --- 4. THE PLAYBOOK ENGINE (AMD LOGIC) ---
+                        now_eat = datetime.utcnow() + timedelta(hours=3)
+                        eat_hour = now_eat.hour
+                        
+                        # Simulated Levels (We will wire these to real session highs/lows later)
+                        # Using offsets to simulate the distance dynamically
+                        asian_L1 = live_price - 5.50 
+                        london_H1 = live_price + 10.20 
+                        
+                        strat = market_state["strategy"]
+                        
+                        if 3 <= eat_hour < 11:
+                            # ASIA
+                            strat["target_name"] = "ASIAN LOW"
+                            strat["target_level"] = asian_L1
+                            strat["playbook_state"] = "BUILDING ASIAN RANGE"
+                            strat["playbook_confidence"] = 50
+                            
+                        elif 11 <= eat_hour < 16:
+                            # LONDON
+                            strat["target_name"] = "LONDON H1"
+                            strat["target_level"] = london_H1
+                            strat["playbook_state"] = "LONDON BLEED ACTIVE (WATCH H2)"
+                            strat["playbook_confidence"] = 75
+                            
+                        elif eat_hour >= 16 or eat_hour < 1:
+                            # NEW YORK (THE 3RD DOCK BUY)
+                            strat["target_name"] = "NY L1 (ASIAN LOW)"
+                            strat["target_level"] = asian_L1
+                            strat["playbook_confidence"] = 85
+                            
+                            # Calculate distance to target
+                            dist = abs(live_price - asian_L1) * 10 # Approx pips
+                            strat["distance_pips"] = round(dist, 1)
+                            
+                            if dist <= 2.0: 
+                                strat["playbook_state"] = "DOCK 3 BUY ENTRY READY"
+                            elif live_price > asian_L1:
+                                strat["playbook_state"] = "H2 BLEED EXHAUSTED // WAIT FOR L1"
+                            else:
+                                strat["playbook_state"] = "AWAITING LONDON BLEED FLUSH"
                                 
         except Exception as e:
             print(f"Deriv Stream Error: {e}. Reconnecting in 5s...")
@@ -151,7 +189,7 @@ def get_market_data():
 @app.route('/api/v1/chat', methods=['POST'])
 def chat():
     if not ai_client:
-        return jsonify({"reply": "Error: AI API key not configured in Render."}), 500
+        return jsonify({"reply": "Error: AI API key not configured."}), 500
 
     user_message = request.json.get("message", "")
     sys_prompt = f"""
@@ -181,19 +219,15 @@ def chat():
 # --- 3. THE NUCLEAR TRADING ENGINE ---
 async def async_deriv_trade(direction):
     ws_url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
-    
     extra_headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Origin": "https://app.deriv.com"
     }
-
     try:
         async with websockets.connect(ws_url, additional_headers=extra_headers) as ws:
             await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
             auth_resp = json.loads(await ws.recv())
-            
-            if 'error' in auth_resp:
-                return {"status": "error", "message": auth_resp['error']['message']}
+            if 'error' in auth_resp: return {"status": "error", "message": auth_resp['error']['message']}
             
             proposal_req = {
                 "proposal": 1, "amount": 1, "basis": "stake",
@@ -203,24 +237,14 @@ async def async_deriv_trade(direction):
             }
             await ws.send(json.dumps(proposal_req))
             proposal_resp = json.loads(await ws.recv())
+            if 'error' in proposal_resp: return {"status": "error", "message": proposal_resp['error']['message']}
             
-            if 'error' in proposal_resp:
-                return {"status": "error", "message": proposal_resp['error']['message']}
-            
-            proposal_id = proposal_resp['proposal']['id']
-            
-            buy_req = {"buy": proposal_id, "price": 1}
+            buy_req = {"buy": proposal_resp['proposal']['id'], "price": 1}
             await ws.send(json.dumps(buy_req))
             buy_resp = json.loads(await ws.recv())
-            
-            if 'error' in buy_resp:
-                return {"status": "error", "message": buy_resp['error']['message']}
-            
-            if 'buy' in buy_resp:
-                return {"status": "success", "message": f"EXECUTED: {direction} 0.10 Lots", "contract_id": buy_resp['buy']['contract_id']}
-                
-            return {"status": "error", "message": "Unknown response from Deriv"}
-            
+            if 'error' in buy_resp: return {"status": "error", "message": buy_resp['error']['message']}
+            if 'buy' in buy_resp: return {"status": "success", "message": f"EXECUTED: {direction}", "contract_id": buy_resp['buy']['contract_id']}
+            return {"status": "error", "message": "Unknown response"}
     except Exception as e:
         return {"status": "error", "message": f"Connection error: {str(e)}"}
 
@@ -228,11 +252,7 @@ async def async_deriv_trade(direction):
 def trade():
     order_data = request.json
     direction = order_data.get("direction", "SELL") 
-    
-    print(f"⚡ INITIATING NUCLEAR STRIKE: {direction}")
-    if not DERIV_TOKEN:
-        return jsonify({"status": "error", "message": "DERIV_TOKEN missing in Render environment"})
-    
+    if not DERIV_TOKEN: return jsonify({"status": "error", "message": "DERIV_TOKEN missing"})
     result = asyncio.run(async_deriv_trade(direction))
     return jsonify(result)
 
@@ -240,60 +260,44 @@ def trade():
 @app.route('/api/v1/news/calendar')
 def get_economic_calendar():
     try:
-        import requests
         url = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
         headers = {"User-Agent": "Mozilla/5.0"}
         response = requests.get(url, headers=headers, timeout=10)
-        
-        if response.status_code != 200:
-            return jsonify({"status": "error", "message": "Failed to fetch news feed"}), 500
+        if response.status_code != 200: return jsonify({"status": "error"}), 500
 
         root = ET.fromstring(response.content)
         news_events = []
-        
         now_utc = datetime.utcnow()
         ny_offset = -4 if 3 < now_utc.month < 11 else -5
         
         for event in root.findall('event'):
             try:
-                impact = event.find('impact').text
-                if impact not in ["High", "Medium"]:
-                    continue
-
+                if event.find('impact').text not in ["High", "Medium"]: continue
                 date_str = event.find('date').text
                 time_str = event.find('time').text
-                
-                if not time_str or "day" in time_str.lower() or ":" not in time_str:
-                    continue
+                if not time_str or "day" in time_str.lower() or ":" not in time_str: continue
 
-                event_dt_str = f"{date_str} {time_str}"
-                event_ny = datetime.strptime(event_dt_str, "%m-%d-%Y %I:%M%p")
-                event_utc = event_ny - timedelta(hours=ny_offset)
-                event_eat = event_utc + timedelta(hours=3)
+                event_ny = datetime.strptime(f"{date_str} {time_str}", "%m-%d-%Y %I:%M%p")
+                event_eat = event_ny - timedelta(hours=ny_offset) + timedelta(hours=3)
 
-                if event_eat < (now_utc + timedelta(hours=3) - timedelta(minutes=5)):
-                    continue
+                if event_eat < (now_utc + timedelta(hours=3) - timedelta(minutes=5)): continue
 
                 news_events.append({
                     "title": event.find('title').text,
                     "country": event.find('country').text,
                     "time": event_eat.strftime("%H:%M"),
-                    "impact": impact,
+                    "impact": event.find('impact').text,
                     "timestamp": event_eat.timestamp()
                 })
-            except Exception:
-                continue 
+            except: continue 
 
         news_events.sort(key=lambda x: x["timestamp"])
         return jsonify({"status": "success", "news": news_events})
-        
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == '__main__':
-    # Start the real-time Deriv WebSocket stream in a background thread
     deriv_thread = threading.Thread(target=start_deriv_stream)
     deriv_thread.daemon = True
     deriv_thread.start()
-    
     app.run(host='0.0.0.0', port=10000)
