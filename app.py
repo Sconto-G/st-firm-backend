@@ -29,34 +29,33 @@ else:
 
 MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
 
+# --- STATE ---
 market_state = {
-    "current_price": "3525.78",
+    "current_price": "0.00",
     "timeframes": {
-        "M5": {"trend": "WAITING", "bias": "WAITING"},
-        "M30": {"trend": "WAITING", "bias": "WAITING"},
-        "H1": {"trend": "WAITING", "bias": "WAITING"},
-        "H4": {"trend": "WAITING", "bias": "WAITING"},
-        "D1": {"trend": "WAITING", "bias": "WAITING"}
+        "M5": {"trend": "WAITING", "candle": "BEAR"},
+        "M30": {"trend": "WAITING", "candle": "BEAR"},
+        "H1": {"trend": "WAITING", "candle": "BEAR"},
+        "H4": {"trend": "WAITING", "candle": "BEAR"},
+        "D1": {"trend": "WAITING", "candle": "BEAR"}
     },
-    "confidence": 0, 
-    "market_posture": "WAITING", 
-    "bloodlust": 0, 
-    "status": "success",
+    "structure": {"trend": "RANGE", "bos": "NONE", "swing_high": 0.0, "swing_low": 0.0},
+    "ignition": {"status": "WAITING", "reason": "Analyzing..."},
+    "bloodlust": 0,
     "strategy": {
-        "target_level": 0.0, 
-        "target_name": "WAITING", 
-        "distance_pips": 0.0, 
-        "playbook_state": "WAITING FOR SETUP", 
-        "playbook_confidence": 0
+        "target_name": "WAITING",
+        "target_level": 0.0,
+        "playbook_state": "WAITING FOR SETUP",
+        "is_locked": False
     }
 }
 
 price_history = []
-last_posture = "WAITING"
 asian_high = 0.0
 asian_low = 0.0
 smoothed_bloodlust = 0.0
 
+# --- HELPER FUNCTIONS ---
 def send_telegram_alert(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
     try:
@@ -64,110 +63,136 @@ def send_telegram_alert(message):
         requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}, timeout=5)
     except Exception as e: print(f"Telegram Error: {e}")
 
-def calculate_trend(prices):
-    if len(prices) < 3: return "WAITING", "WAITING"
-    if prices[-1] > prices[0]: return "UPTREND", "BULLISH"
-    elif prices[-1] < prices[0]: return "DOWNTREND", "BEARISH"
-    return "WAITING", "WAITING"
+def calculate_rsi(prices, period=14):
+    if len(prices) < period: return 50
+    gains, losses = 0, 0
+    for i in range(1, len(prices)):
+        diff = prices[i] - prices[i-1]
+        if diff > 0: gains += diff
+        else: losses -= diff
+    if losses == 0: return 100
+    rs = (gains/period) / (losses/period)
+    return 100 - (100 / (1 + rs))
 
+def calculate_structure(prices):
+    if len(prices) < 20: return "RANGE", "NONE", 0.0, 0.0
+    recent = prices[-20:]
+    swing_high = max(recent)
+    swing_low = min(recent)
+    
+    # BOS Logic
+    bos = "NONE"
+    if prices[-1] > swing_high * 0.999: bos = "UP"
+    elif prices[-1] < swing_low * 1.001: bos = "DOWN"
+    
+    # Trend Logic (using half windows)
+    mid = len(recent) // 2
+    if sum(recent[mid:]) / mid > sum(recent[:mid]) / mid: trend = "BULLISH"
+    else: trend = "BEARISH"
+    
+    return trend, bos, swing_high, swing_low
+
+# --- CORE ENGINE LOOP ---
 def price_loop():
-    global last_posture, asian_high, asian_low, smoothed_bloodlust
-    print("🚀 Starting Advanced Price Loop...")
+    global asian_high, asian_low, smoothed_bloodlust
+    print("🚀 Starting Institutional Engine...")
     
     while True:
         try:
             response = requests.get("https://api.gold-api.com/price/XAU", timeout=5)
             live_price = float(response.json()['price'])
             
-            # 1. Smoothed Bloodlust (Jitter Filter)
-            velocity = 0
-            if len(price_history) > 0:
-                velocity = abs(live_price - price_history[-1]) * 100
+            # 1. Bloodlust Smoothing
+            velocity = abs(live_price - price_history[-1]) * 100 if price_history else 0
             raw_bloodlust = min(int(velocity * 10), 100)
-            # EMA Smoothing (30% new, 70% old)
             smoothed_bloodlust = (raw_bloodlust * 0.3) + (smoothed_bloodlust * 0.7)
             market_state["bloodlust"] = int(smoothed_bloodlust)
             
-            # 2. Update Price & History
+            # 2. Price & History
             market_state["current_price"] = str(round(live_price, 2))
             price_history.append(live_price)
             if len(price_history) > 100: price_history.pop(0)
             
-            # 3. Independent Timeframe Logic
-            if len(price_history) > 5:
-                trend_1m, bias_1m = calculate_trend(price_history[-5:])
-                trend_5m, bias_5m = calculate_trend(price_history[-15:]) if len(price_history) > 15 else (trend_1m, bias_1m)
-                trend_15m, bias_15m = calculate_trend(price_history[-30:]) if len(price_history) > 30 else (trend_5m, bias_5m)
-                trend_30m, bias_30m = calculate_trend(price_history[-50:]) if len(price_history) > 50 else (trend_15m, bias_15m)
+            # 3. Independent Timeframes
+            if len(price_history) > 15:
+                market_state["timeframes"]["M5"] = {"trend": "BULL" if price_history[-1] > price_history[-5] else "BEAR", "candle": "BULL" if price_history[-1] > price_history[-2] else "BEAR"}
+                market_state["timeframes"]["M30"] = {"trend": "BULL" if price_history[-1] > price_history[-15] else "BEAR", "candle": "BULL" if price_history[-1] > price_history[-2] else "BEAR"}
+                market_state["timeframes"]["H1"] = {"trend": "BULL" if price_history[-1] > price_history[-30] else "BEAR", "candle": "BULL" if price_history[-1] > price_history[-2] else "BEAR"}
                 
-                market_state["timeframes"]["M5"] = {"trend": trend_1m, "bias": bias_1m}
-                market_state["timeframes"]["M30"] = {"trend": trend_5m, "bias": bias_5m}
-                market_state["timeframes"]["H1"] = {"trend": trend_15m, "bias": bias_15m}
-                market_state["timeframes"]["H4"] = {"trend": trend_30m, "bias": bias_30m}
-                market_state["timeframes"]["D1"] = {"trend": trend_30m, "bias": bias_30m} # Placeholder
-
-                # 4. Dynamic Confidence (0-100%)
-                # Combines Bloodlust + Confluence of Timeframes
-                bull_count = sum(1 for tf in market_state["timeframes"].values() if tf["bias"] == "BULLISH")
-                bear_count = sum(1 for tf in market_state["timeframes"].values() if tf["bias"] == "BEARISH")
-                
-                base_conf = max(bull_count, bear_count) * 20 # Max 100
-                market_state["confidence"] = min(base_conf + int(smoothed_bloodlust * 0.2), 99)
-                
-                if bull_count > bear_count:
-                    market_state["market_posture"] = "BUY"
-                elif bear_count > bull_count:
-                    market_state["market_posture"] = "SELL"
-                else:
-                    market_state["market_posture"] = "WAITING"
-
-            # 5. REAL Asian Session Targets & Playbook
+            # 4. Structure & BOS
+            trend, bos, sh, sl = calculate_structure(price_history)
+            market_state["structure"] = {"trend": trend, "bos": bos, "swing_high": round(sh, 2), "swing_low": round(sl, 2)}
+            
+            # 5. Session Targets (Target Lock)
             now_eat = datetime.utcnow() + timedelta(hours=3)
             eat_hour = now_eat.hour
             strat = market_state["strategy"]
             
-            # Track Asian High/Low (00:00 - 08:00 EAT)
+            # Track Asian Range (00:00 - 08:00 EAT)
             if 0 <= eat_hour < 8:
                 if asian_high == 0.0 or live_price > asian_high: asian_high = live_price
                 if asian_low == 0.0 or live_price < asian_low: asian_low = live_price
-                strat["target_name"] = "BUILDING ASIAN RANGE"
+                strat["target_name"] = "BUILDING ASIA"
                 strat["target_level"] = round(asian_low, 2)
                 strat["playbook_state"] = "ACCUMULATION PHASE"
+                strat["is_locked"] = False
             else:
-                # Locked targets after Asia closes
                 if asian_low == 0.0: asian_low = live_price - 5.50 # Fallback
                 
-                if 8 <= eat_hour < 16:
-                    strat["target_name"] = "LONDON H1"
-                    strat["target_level"] = round(asian_high + 10.0, 2) # Example London target
-                    strat["playbook_state"] = "LONDON BLEED ACTIVE"
-                else:
-                    strat["target_name"] = "NY L1 (ASIAN LOW)"
-                    strat["target_level"] = round(asian_low, 2)
-                    
-                    dist = abs(live_price - asian_low) * 10
-                    strat["distance_pips"] = round(dist, 1)
-                    
-                    if dist <= 2.0:
-                        strat["playbook_state"] = "DOCK 3 BUY ENTRY READY"
-                    elif live_price > asian_low:
-                        strat["playbook_state"] = "H2 BLEED EXHAUSTED"
+                # Locking the Target
+                if not strat["is_locked"]:
+                    if 8 <= eat_hour < 16:
+                        strat["target_name"] = "LONDON H1"
+                        strat["target_level"] = round(asian_high + 10.0, 2)
                     else:
-                        strat["playbook_state"] = "AWAITING BLEED FLUSH"
+                        strat["target_name"] = "NY L1 (ASIAN LOW)"
+                        strat["target_level"] = round(asian_low, 2)
+                    strat["is_locked"] = True # LOCK IT
+                
+                # Playbook State
+                dist = abs(live_price - strat["target_level"]) * 10
+                if dist <= 2.0:
+                    strat["playbook_state"] = "TARGET HIT"
+                elif live_price > strat["target_level"] and eat_hour >= 16:
+                    strat["playbook_state"] = "H2 BLEED EXHAUSTED"
+                else:
+                    strat["playbook_state"] = "AWAITING FLUSH"
+
+            # 6. The Ignition Logic
+            rsi = calculate_rsi(price_history)
+            ign = market_state["ignition"]
+            
+            if market_state["structure"]["trend"] == "BULLISH" and bos == "UP" and rsi < 70:
+                if dist <= 5.0: # Close to target
+                    ign["status"] = "BUY"
+                    ign["reason"] = f"BOS UP + RSI {int(rsi)} + Near Target"
+                else:
+                    ign["status"] = "WAITING"
+                    ign["reason"] = "Bullish structure, awaiting pullback."
+            elif market_state["structure"]["trend"] == "BEARISH" and bos == "DOWN" and rsi > 30:
+                if dist <= 5.0:
+                    ign["status"] = "SELL"
+                    ign["reason"] = f"BOS DOWN + RSI {int(rsi)} + Near Target"
+                else:
+                    ign["status"] = "WAITING"
+                    ign["reason"] = "Bearish structure, awaiting pullback."
+            else:
+                ign["status"] = "WAITING"
+                ign["reason"] = "Conditions not met."
 
         except Exception as e:
-            print(f"❌ Error: {e}")
+            print(f"Error: {e}")
             
-        time.sleep(1) # FAST REFRESH
+        time.sleep(1)
 
 @app.route('/api/v1/market/xauusd')
 def get_market_data(): return jsonify(market_state)
 
-# --- AI, TRADING, NEWS (Same as before) ---
+# --- AI, NEWS, TRADING (Kept clean) ---
 @app.route('/api/v1/chat', methods=['POST'])
 def chat():
     if not ai_client: return jsonify({"reply": "Error"}), 500
-    sys_prompt = f"ST-FIRM AI. Price: {market_state['current_price']}, Posture: {market_state['market_posture']}. Answer briefly."
+    sys_prompt = f"ST-FIRM AI. Price: {market_state['current_price']}, Ignition: {market_state['ignition']['status']}. Answer briefly."
     for model in MODELS:
         try:
             res = ai_client.models.generate_content(model=model, contents=sys_prompt + "\nUser: " + request.json.get("message", ""), config=types.GenerateContentConfig(temperature=0.2))
@@ -176,8 +201,7 @@ def chat():
     return jsonify({"reply": "AI Error"}), 500
 
 async def async_deriv_trade(direction):
-    # (Same trading logic as before)
-    return {"status": "success", "message": "Simulated"}
+    return {"status": "success", "message": "Simulated Trade"}
 
 @app.route('/api/v1/trade', methods=['POST'])
 def trade(): return jsonify(asyncio.run(async_deriv_trade(request.json.get("direction", "SELL"))))
