@@ -87,7 +87,7 @@ def get_ai_briefing(context, is_sweep):
 
 # --- MAIN ENGINE ---
 def main_loop():
-    global asian_high, asian_low, last_sweep_time
+    global asian_high, asian_low, last_sweep_time, last_ai_update
     print("🚀 Starting Predator Engine V2...")
     
     while True:
@@ -166,6 +166,14 @@ else:
                 market_state["timeframes"]["M30"] = "BULL" if gold_price > gold_prices[-15] else "BEAR"
                 market_state["timeframes"]["H1"] = "BULL" if gold_price > market_state["vwap"] else "BEAR"
                 
+           # 5. Force AI Briefing update every 15 seconds
+if 'last_ai_update' not in globals(): last_ai_update = 0
+
+if time.time() - last_ai_update > 15:
+    context = f"Price: {gold_price}, Target: {target_price}, SMT: {market_state['smt_divergence']}, VWAP: {market_state['vwap']}, Gate: {market_state['gate']['status']}"
+    market_state["ai_briefing"] = get_ai_briefing(context, is_sweep=(market_state["gate"]["status"] == "TRAP LOCKED"))
+    last_ai_update = time.time()
+
         except Exception as e:
             print(f"Engine Error: {e}")
             
