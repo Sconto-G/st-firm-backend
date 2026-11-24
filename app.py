@@ -120,16 +120,16 @@ def main_loop():
             eat_hour = now_eat.hour
             
             if 3 <= eat_hour < 9:
-    if asian_high == 0.0 or gold_price > asian_high: asian_high = gold_price
-    if asian_low == 0.0 or gold_price < asian_low: asian_low = gold_price
-    market_state["target"] = {"name": "BUILDING ASIAN RANGE", "price": round(asian_low, 2), "status": "PENDING"}
-    market_state["gate"] = {"status": "HIBERNATION", "reason": "Accumulation Phase."}
-else:
-    # FALLBACK FIX: If server restarts outside Asia session
-    if asian_low == 0.0: asian_low = gold_price - 10.0
-    if asian_high == 0.0: asian_high = gold_price + 10.0
+                if asian_high == 0.0 or gold_price > asian_high: asian_high = gold_price
+                if asian_low == 0.0 or gold_price < asian_low: asian_low = gold_price
+                market_state["target"] = {"name": "BUILDING ASIAN RANGE", "price": round(asian_low, 2), "status": "PENDING"}
+                market_state["gate"] = {"status": "HIBERNATION", "reason": "Accumulation Phase."}
+            else:
+                # FALLBACK FIX: If server restarts outside Asia session
+                if asian_low == 0.0: asian_low = gold_price - 10.0
+                if asian_high == 0.0: asian_high = gold_price + 10.0
 
-    target_price = asian_low if eat_hour >= 15 else asian_high
+                target_price = asian_low if eat_hour >= 15 else asian_high
                 
                 # State Machine: Scan -> Sweep -> Locked -> Reclaim -> Clear
                 dist = abs(gold_price - target_price) * 10 # pips approx
