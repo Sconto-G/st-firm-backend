@@ -75,10 +75,23 @@ def calculate_rsi(prices, period=14):
     return 100 - (100 / (1 + rs))
 
 def calculate_structure(prices):
-    if len(prices) < 20: return "RANGE", "NONE", 0.0, 0.0
-    recent = prices[-20:]
+    # Look at the last 60 ticks (approx 1 minute) for real swings
+    if len(prices) < 60: return "RANGE", "NONE", 0.0, 0.0
+    recent = prices[-60:]
     swing_high = max(recent)
     swing_low = min(recent)
+    
+    # Stricter BOS Logic (Requires actual break, not micro-movement)
+    bos = "NONE"
+    if prices[-1] > swing_high: bos = "UP"
+    elif prices[-1] < swing_low: bos = "DOWN"
+    
+    # Trend Logic (using moving averages of the 60-tick window)
+    mid = len(recent) // 2
+    if sum(recent[mid:]) / mid > sum(recent[:mid]) / mid: trend = "BULLISH"
+    else: trend = "BEARISH"
+    
+    return trend, bos, swing_high, swing_low
     
     # BOS Logic
     bos = "NONE"
