@@ -80,7 +80,6 @@ def log_event(event):
 def get_ai_briefing():
     if not ai_client: return {"observation": "AI offline", "inference": "N/A", "decision": "WAIT"}
     
-    # Layer A: The Zero-Lag Telemetry Packet
     payload = {
         "clock": {"eat_time": (datetime.utcnow() + timedelta(hours=3)).strftime("%H:%M"), "macro_state": market_state["macro_state"]},
         "structure": market_state["structure"],
@@ -89,7 +88,6 @@ def get_ai_briefing():
         "history": market_state["session_history"]
     }
     
-    # Layer B: The 5 Unbreakable Cognitive Laws
     sys_prompt = f"""
     You are Overlord AI, a cold-blooded institutional gold trader. You command the 3-Dock Playbook.
     Here is the live telemetry packet: {json.dumps(payload)}
@@ -121,20 +119,19 @@ def main_loop():
     while True:
         try:
             # 1. Fetch Gold and Silver (With Backup Fallback)
-try:
-    gold_res = requests.get("https://api.gold-api.com/price/XAU", timeout=5).json()
-    gold_price = float(gold_res['price'])
-except:
-    # Fallback to another reliable API if gold-api is down
-    fallback = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT", timeout=5).json()
-    gold_price = float(fallback['price'])
+            try:
+                gold_res = requests.get("https://api.gold-api.com/price/XAU", timeout=5).json()
+                gold_price = float(gold_res['price'])
+            except:
+                fallback = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT", timeout=5).json()
+                gold_price = float(fallback['price'])
 
-try:
-    silver_res = requests.get("https://api.gold-api.com/price/XAG", timeout=5).json()
-    silver_price = float(silver_res['price'])
-except:
-    silver_price = gold_price / 80.0 # Simulated fallback just in case
-            
+            try:
+                silver_res = requests.get("https://api.gold-api.com/price/XAG", timeout=5).json()
+                silver_price = float(silver_res['price'])
+            except:
+                silver_price = gold_price / 80.0
+
             gold_prices.append(gold_price); silver_prices.append(silver_price)
             if len(gold_prices) > 100: gold_prices.pop(0); silver_prices.pop(0)
             market_state["current_price"] = str(round(gold_price, 2))
@@ -188,7 +185,6 @@ except:
             dist_to_high = abs(gold_price - asian_high)
             market_state["checklist"] = {"sweep": False, "displacement": False, "fvg": False}
             
-            # Example Trap Logic (Simplified for code structure)
             if market_state["macro_state"] == "LONDON_OPEN_MACRO" or market_state["macro_state"] == "DOCK_1_RECOVERY_WINDOW":
                 if dist_to_low <= 1.5:
                     market_state["checklist"]["sweep"] = True
@@ -201,11 +197,11 @@ except:
                         "entry": round(gold_price, 2),
                         "sl": round(asian_low - 3.5, 2),
                         "tp": round(vwap, 2),
-                        "risk_pct": 0.4, # Dock 1 risk
+                        "risk_pct": 0.4,
                         "lots": 0.15
                     }
             
-            # 7. AI Evaluation (Only on 5m close or events)
+            # 7. AI Evaluation
             if time.time() - last_ai_update > 300 or market_state["checklist"]["sweep"]:
                 market_state["ai_briefing"] = get_ai_briefing()
                 last_ai_update = time.time()
