@@ -8,7 +8,7 @@ import json
 import websockets
 import requests
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from google import genai
 from google.genai import types
 
@@ -63,7 +63,8 @@ def calculate_vwap(prices):
     return sum(prices) / len(prices)
 
 def log_event(event):
-    eat_time = (datetime.utcnow() + timedelta(hours=3)).strftime("%H:%M")
+    # FIXED: Uses timezone-aware datetime
+    eat_time = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%H:%M")
     market_state["session_history"].append(f"{eat_time} EAT: {event}")
     if len(market_state["session_history"]) > 5:
         market_state["session_history"].pop(0)
@@ -73,7 +74,8 @@ def get_ai_briefing():
     if not ai_client: return {"observation": "AI offline", "inference": "N/A", "decision": "WAIT"}
     
     payload = {
-        "clock": {"eat_time": (datetime.utcnow() + timedelta(hours=3)).strftime("%H:%M"), "macro_state": market_state["macro_state"]},
+        # FIXED: Uses timezone-aware datetime
+        "clock": {"eat_time": (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%H:%M"), "macro_state": market_state["macro_state"]},
         "structure": market_state["structure"],
         "liquidity": market_state["liquidity_matrix"],
         "triggers": market_state["checklist"],
@@ -98,7 +100,6 @@ def get_ai_briefing():
             config=types.GenerateContentConfig(temperature=0.1, response_mime_type="application/json")
         )
         
-        # Clean the JSON response in case Gemini adds markdown formatting
         text = res.text.strip()
         if text.startswith("```json"):
             text = text[7:]
@@ -125,7 +126,6 @@ def main_loop():
                 binance_res = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT", timeout=5).json()
                 gold_price = float(binance_res['price'])
             except:
-                # Fallback to slow API
                 gold_res = requests.get("https://api.gold-api.com/price/XAU", timeout=5).json()
                 gold_price = float(gold_res['price'])
 
@@ -140,7 +140,8 @@ def main_loop():
             market_state["current_price"] = str(round(gold_price, 2))
             
             # 2. Time & Daily Reset (03:00 EAT)
-            now_eat = datetime.utcnow() + timedelta(hours=3)
+            # FIXED: Uses timezone-aware datetime
+            now_eat = datetime.now(timezone.utc) + timedelta(hours=3)
             eat_str = now_eat.strftime("%Y-%m-%d")
             eat_hour = now_eat.hour + (now_eat.minute / 60.0)
             
@@ -208,17 +209,9 @@ def main_loop():
 @app.route('/api/v1/market/xauusd')
 def get_market_data(): return jsonify(market_state)
 
-@app.route('/api/v1/chat', methods=['POST'])
-def chat():
-    return jsonify({"reply": "Overlord AI Online."})
-
 @app.route('/api/v1/trade', methods=['POST'])
 def trade():
     return jsonify({"status": "success", "message": "Simulated Trade"})
-
-@app.route('/api/v1/news/calendar')
-def get_news():
-    return jsonify({"status": "success", "news": []})
 
 if __name__ == '__main__':
     threading.Thread(target=main_loop, daemon=True).start()
