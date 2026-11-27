@@ -1,11 +1,13 @@
 """
-ST-FIRM WATCHER backend  --  Phase 1
-- Price feed that tells you WHY it has no price (see /api/v1/debug)
-- Every log line is flushed, so Render shows errors immediately
-- Engine, AI and feeds each run in their own thread (AI can no longer freeze prices)
-- Asian range + session average reset every EAT day
-- Sweep -> displacement -> FVG is now a real sequence with memory (1-minute candles built from ticks)
-- /chat works; /trade and /campaign/action are SAFE STUBS (analysis only, no orders)
+ST-FIRM WATCHER backend  v2
+Live price now comes from sources Render can actually reach (probe-verified):
+  1. Binance PAXGUSDT  (polled every 1s, keep-alive session)   <- main feed
+  2. Kraken  PAXGUSD   (only when Binance is silent)
+  3. Deriv websocket   (OFF by default: it returns HTTP 520 to Render. Set ENABLE_DERIV=1 to retry)
+PAXG is a gold-backed token, so it is a PROXY for XAUUSD. If TWELVEDATA_API_KEY is set, the real
+XAU/USD quote is fetched every 150s and the gap (offset) is added to PAXG, so the HUD price tracks spot.
+Without that key the HUD marks the price as PROXY.
+Analysis only: /trade and /campaign/action are disabled stubs. No orders are ever sent.
 """
 import os
 import json
@@ -15,42 +17,64 @@ import threading
 from datetime import datetime, timedelta, timezone
 
 import requests
-import websockets
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from google import genai
-from google.genai import types
+
+try:
+    from google import genai
+    from google.genai import types
+except Exception:  # app must still boot if the AI package is missing
+    genai = None
+    types = None
 
 app = Flask(__name__)
-CORS(app)  # TODO before execution exists: restrict to your Vercel domain
+CORS(app)  # TODO before any execution exists: restrict to your Vercel domain
 
 # ------------------------------------------------------------------ CONFIG
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")  # change in Render env if Google renames it
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY")
+ENABLE_DERIV = os.environ.get("ENABLE_DERIV", "0") == "1"
 DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "1089")
-DERIV_HOSTS = ["ws.derivws.com", "ws.binaryws.com"]        # tried in turn if one is rejected
-TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY")  # free key: 800 calls/day -> polled every 2 min (DELAYED)
+PROBE_ON_START = os.environ.get("PROBE_ON_START", "0") == "1"
 
-ASIAN_START, ASIAN_END = 0.0, 9.0   # EAT hours, same as your original
-SWEEP_DISPLACEMENT = 2.0            # points above Asian low = displacement
-SL_BUFFER = 3.5                     # points under the sweep low
-RR = 2.0                            # take-profit = entry + RR * risk
+ASIAN_START, ASIAN_END = 0.0, 9.0   # EAT hours
+SWEEP_DISPLACEMENT = 2.0            # points above Asian low
+SL_BUFFER = 3.5                     # points below the sweep low
+RR = 2.0                            # TP = entry + RR * risk
 SETUP_LIFETIME = 30 * 60            # seconds an A+ setup stays on screen
+STALE_AFTER = 15                    # seconds without a tick = feed down
+CAL_MAX_AGE = 6 * 3600              # a calibration older than this is ignored
 
 ai_client = None
-if GEMINI_API_KEY:
-    ai_client = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=30000))
+if GEMINI_API_KEY and genai is not None:
+    try:
+        ai_client = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=30000))
+    except Exception as _e:
+        print("WARN AI client could not start:", _e, flush=True)
 
 
 def log(*a):
     print(*a, flush=True)
 
 
+_last_warn = {}
+
+
+def warn(key, msg, every=60):
+    """Rate-limited log so a down source cannot flood the logs."""
+    now = time.time()
+    if now - _last_warn.get(key, 0) >= every:
+        _last_warn[key] = now
+        log("WARN", key, msg)
+
+
 # ------------------------------------------------------------------ STATE
 STARTED = time.time()
 
-feed = {"price": None, "source": None, "ts": 0.0, "ticks": 0, "delayed": False,
-        "deriv_error": None, "gold_api_error": None, "twelvedata_error": None}
+raw = {"price": None, "source": None, "ts": 0.0, "ticks": 0}
+cal = {"offset": 0.0, "ts": 0.0, "ref": None, "ref_ts": 0.0}
+feed_err = {}
 
 market_state = {
     "current_price": "0.00",
@@ -65,7 +89,7 @@ market_state = {
     "checklist": {"sweep": False, "displacement": False, "fvg": False},
     "execution": {"grade": "WAITING", "entry": 0.0, "sl": 0.0, "tp": 0.0, "risk_pct": 1.0, "lots": 0.0},
     "ai_briefing": {"observation": "Initializing...", "inference": "Initializing...", "decision": "WAIT"},
-    "feed": {"ok": False, "source": None, "age_sec": None},
+    "feed": {"ok": False, "source": None, "age_sec": None, "proxy": True, "calibrated": False, "offset": 0.0},
     "range_ready": False,
     "uptime_sec": 0,
     "session_history": [],
@@ -74,15 +98,29 @@ market_state = {
 day = {"date": "", "asian_high": 0.0, "asian_low": 0.0, "sum": 0.0, "n": 0,
        "swept": False, "sweep_low": None, "displaced": False, "fvg": False, "exec_ts": 0.0}
 
-candles = []  # 1-minute candles built from ticks
+candles = []  # 1-minute candles built from the price
 
 
-def set_price(p, source, delayed=False):
-    feed["price"] = p
-    feed["source"] = source
-    feed["delayed"] = delayed
-    feed["ts"] = time.time()
-    feed["ticks"] += 1
+def set_raw(p, source):
+    raw["price"] = p
+    raw["source"] = source
+    raw["ts"] = time.time()
+    raw["ticks"] += 1
+
+
+def output_price():
+    """Returns (price or None, feed-meta). Applies the XAU/PAXG offset when we have a fresh one."""
+    now = time.time()
+    age = now - raw["ts"] if raw["ts"] else None
+    if raw["price"] is None or age is None or age > STALE_AFTER:
+        return None, {"ok": False, "source": raw["source"], "age_sec": round(age, 1) if age is not None else None,
+                      "proxy": True, "calibrated": False, "offset": 0.0}
+    exact = raw["source"] == "deriv"   # Deriv quotes real spot, no offset needed
+    use_off = (not exact) and cal["ts"] > 0 and (now - cal["ts"]) < CAL_MAX_AGE
+    price = raw["price"] + (cal["offset"] if use_off else 0.0)
+    return price, {"ok": True, "source": raw["source"], "age_sec": round(age, 1),
+                   "proxy": (not exact) and (not use_off), "calibrated": bool(use_off),
+                   "offset": round(cal["offset"], 2) if use_off else 0.0}
 
 
 def update_candles(price, now_ts):
@@ -99,7 +137,7 @@ def update_candles(price, now_ts):
 
 
 def bullish_fvg():
-    """Last 3 CLOSED candles: gap between candle1 high and candle3 low."""
+    """Gap between candle 1 high and candle 3 low, using the last 3 CLOSED candles."""
     if len(candles) < 4:
         return False
     c1, c3 = candles[-4], candles[-2]
@@ -107,95 +145,105 @@ def bullish_fvg():
 
 
 # ------------------------------------------------------------------ PRICE FEEDS
-async def deriv_stream():
-    i = 0
+def poll_binance():
+    s = requests.Session()
+    s.headers.update({"User-Agent": "Mozilla/5.0"})
+    fails = 0
     while True:
-        host = DERIV_HOSTS[i % len(DERIV_HOSTS)]
-        url = f"wss://{host}/websockets/v3?app_id={DERIV_APP_ID}"
         try:
-            async with websockets.connect(url, ping_interval=20, open_timeout=15) as ws:
-                await ws.send(json.dumps({"ticks": "frxXAUUSD", "subscribe": 1}))
-                log(f"Deriv: connected to {host}, subscribed to frxXAUUSD")
-                while True:
-                    data = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
-                    if "error" in data:
-                        raise RuntimeError(data["error"].get("message", "deriv error"))
-                    if "tick" in data:
-                        set_price(float(data["tick"]["quote"]), "deriv")
-                        feed["deriv_error"] = None
+            r = s.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": "PAXGUSDT"}, timeout=(4, 4))
+            r.raise_for_status()
+            set_raw(float(r.json()["price"]), "binance-paxg")
+            if fails:
+                log("Binance feed recovered")
+            fails = 0
+            feed_err.pop("binance", None)
         except Exception as e:
-            feed["deriv_error"] = f"{host}: {type(e).__name__}: {e}"
-            log("Deriv stream error:", feed["deriv_error"])
-            i += 1
-            await asyncio.sleep(10)
+            fails += 1
+            feed_err["binance"] = f"{type(e).__name__}: {str(e)[:100]}"
+            warn("binance", feed_err["binance"])
+        time.sleep(1 if fails == 0 else min(2 + fails, 10))
 
 
-def start_deriv():
-    asyncio.run(deriv_stream())
-
-
-def rest_fallback():
-    """Runs only while the Deriv stream is silent. Backs off when a source keeps failing."""
-    last_td = 0.0
+def poll_kraken():
+    """Backup only: runs when Binance has been silent for 5s."""
+    s = requests.Session()
+    s.headers.update({"User-Agent": "Mozilla/5.0"})
     while True:
-        wait = 3
-        if time.time() - feed["ts"] > 8 or feed["delayed"]:
-            try:
-                r = requests.get("https://api.gold-api.com/price/XAU", timeout=(3, 5))
+        try:
+            if time.time() - raw["ts"] > 5:
+                r = s.get("https://api.kraken.com/0/public/Ticker", params={"pair": "PAXGUSD"}, timeout=(4, 5))
                 r.raise_for_status()
-                set_price(float(r.json()["price"]), "gold-api")
-                feed["gold_api_error"] = None
-            except Exception as e:
-                feed["gold_api_error"] = f"{type(e).__name__}: {str(e)[:120]}"
-                log("gold-api error:", feed["gold_api_error"])
-                wait = 15  # don't hammer a source that is down
-                # last resort: Twelve Data free tier, once per 2 min (800 calls/day cap)
-                if TWELVEDATA_API_KEY and time.time() - last_td > 120 and time.time() - feed["ts"] > 8:
-                    last_td = time.time()
-                    try:
-                        r = requests.get("https://api.twelvedata.com/price",
-                                         params={"symbol": "XAU/USD", "apikey": TWELVEDATA_API_KEY}, timeout=(3, 6))
-                        r.raise_for_status()
-                        set_price(float(r.json()["price"]), "twelvedata", delayed=True)
-                        feed["twelvedata_error"] = None
-                    except Exception as e2:
-                        feed["twelvedata_error"] = f"{type(e2).__name__}: {str(e2)[:120]}"
-                        log("twelvedata error:", feed["twelvedata_error"])
+                k = next(iter(r.json()["result"].values()))
+                set_raw(float(k["c"][0]), "kraken-paxg")
+                feed_err.pop("kraken", None)
+        except Exception as e:
+            feed_err["kraken"] = f"{type(e).__name__}: {str(e)[:100]}"
+            warn("kraken", feed_err["kraken"])
+        time.sleep(2)
+
+
+def calibrate_loop():
+    """Real XAU/USD every 150s (free plan = 800 calls/day) -> offset between spot and the PAXG proxy."""
+    if not TWELVEDATA_API_KEY:
+        log("Calibration OFF: set TWELVEDATA_API_KEY to align the PAXG proxy with XAU/USD")
+        return
+    s = requests.Session()
+    while True:
+        wait = 150
+        try:
+            fresh = raw["price"] is not None and time.time() - raw["ts"] < STALE_AFTER and raw["source"] != "deriv"
+            if not fresh:
+                time.sleep(3)   # no proxy price yet (startup) - wait for it instead of burning a call
+                continue
+            r = s.get("https://api.twelvedata.com/price",
+                      params={"symbol": "XAU/USD", "apikey": TWELVEDATA_API_KEY}, timeout=(4, 6))
+            j = r.json()
+            if "price" not in j:
+                raise RuntimeError(str(j.get("message", j))[:140])
+            ref = float(j["price"])
+            cal["ref"], cal["ref_ts"] = ref, time.time()
+            fresh = raw["price"] is not None and time.time() - raw["ts"] < STALE_AFTER and raw["source"] != "deriv"
+            if fresh:
+                new = ref - raw["price"]
+                if abs(new) <= 0.03 * ref:
+                    cal["offset"] = new if cal["ts"] == 0 else 0.6 * new + 0.4 * cal["offset"]
+                    cal["ts"] = time.time()
+                    log(f"Calibrated: XAU={ref} proxy={raw['price']} offset={cal['offset']:.2f}")
+                else:
+                    warn("calibrate", f"offset {new:.1f} looks wrong, ignored")
+            feed_err.pop("twelvedata", None)
+        except Exception as e:
+            feed_err["twelvedata"] = f"{type(e).__name__}: {str(e)[:140]}"
+            warn("twelvedata", feed_err["twelvedata"], every=300)
+            wait = 60   # a bad key / hiccup: try again in a minute, not 2.5
         time.sleep(wait)
 
 
-
-# ------------------------------------------------------------------ OUTBOUND PROBE
-PROBE_TARGETS = {
-    "google": "https://www.google.com/generate_204",
-    "gold-api": "https://api.gold-api.com/price/XAU",
-    "twelvedata": "https://api.twelvedata.com/price?symbol=XAU/USD",   # 401 without key = reachable
-    "deriv-http": "https://ws.derivws.com/",
-    "stooq-xauusd": "https://stooq.com/q/l/?s=xauusd&f=sd2t2c&h&e=csv",
-    "kraken-paxg": "https://api.kraken.com/0/public/Ticker?pair=PAXGUSD",
-    "binance-paxg": "https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT",
-}
-probe_results = {}
-
-
-def _probe_one(name, url):
-    t0 = time.time()
-    try:
-        r = requests.get(url, timeout=(5, 8), headers={"User-Agent": "Mozilla/5.0"})
-        probe_results[name] = {"ok": True, "status": r.status_code, "ms": int((time.time() - t0) * 1000),
-                               "sample": r.text[:80].replace("\n", " ")}
-    except Exception as e:
-        probe_results[name] = {"ok": False, "ms": int((time.time() - t0) * 1000),
-                               "error": f"{type(e).__name__}: {str(e)[:90]}"}
-    log("PROBE", name, probe_results[name])
+async def _deriv_stream():
+    import websockets
+    url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+    while True:
+        try:
+            async with websockets.connect(url, ping_interval=20, open_timeout=15) as ws:
+                await ws.send(json.dumps({"ticks": "frxXAUUSD", "subscribe": 1}))
+                log("Deriv connected")
+                while True:
+                    data = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
+                    if "error" in data:
+                        raise RuntimeError(data["error"].get("message", "deriv"))
+                    if "tick" in data:
+                        set_raw(float(data["tick"]["quote"]), "deriv")
+                        feed_err.pop("deriv", None)
+        except Exception as e:
+            feed_err["deriv"] = f"{type(e).__name__}: {str(e)[:100]}"
+            warn("deriv", feed_err["deriv"], every=300)
+            await asyncio.sleep(60)
 
 
-def run_probe():
-    ts = [threading.Thread(target=_probe_one, args=(n, u), daemon=True) for n, u in PROBE_TARGETS.items()]
-    for t in ts:
-        t.start()
-    for t in ts:
-        t.join(timeout=15)
+def start_deriv():
+    asyncio.run(_deriv_stream())
+
 
 # ------------------------------------------------------------------ ENGINE
 def reset_day(date_str):
@@ -212,14 +260,11 @@ def engine_step():
     date_str = now.strftime("%Y-%m-%d")
     h = now.hour + now.minute / 60.0
 
-    age = time.time() - feed["ts"] if feed["ts"] else None
-    fresh = age is not None and age < (300 if feed["delayed"] else 30)
-    market_state["feed"] = {"ok": fresh, "source": feed["source"], "delayed": feed["delayed"],
-                            "age_sec": round(age, 1) if age is not None else None}
+    price, meta = output_price()
+    market_state["feed"] = meta
     market_state["uptime_sec"] = int(time.time() - STARTED)
-    if not fresh:
+    if price is None:
         return
-    price = feed["price"]
 
     if date_str != day["date"]:
         reset_day(date_str)
@@ -228,9 +273,8 @@ def engine_step():
     update_candles(price, time.time())
     day["sum"] += price
     day["n"] += 1
-    avg = day["sum"] / day["n"]  # session AVERAGE price (no volume in this feed, so not true VWAP)
+    avg = day["sum"] / day["n"]  # session AVERAGE price (no volume data, so not a true VWAP)
 
-    # macro state (unchanged windows)
     if 4.0 <= h < 4.75:
         ms = "ASIAN_JUDAS_WINDOW"
     elif 6.0 <= h < 7.0:
@@ -245,7 +289,6 @@ def engine_step():
         ms = "HIBERNATION"
     market_state["macro_state"] = ms
 
-    # Asian range builds 00:00-09:00 EAT, then freezes
     if ASIAN_START <= h < ASIAN_END:
         if day["asian_high"] == 0.0 or price > day["asian_high"]:
             day["asian_high"] = price
@@ -254,18 +297,15 @@ def engine_step():
     range_ready = h >= ASIAN_END and day["asian_low"] > 0.0
     market_state["range_ready"] = range_ready
 
-    # bias (temporary): price vs session average
-    market_state["structure"]["d1_bias"] = "BULL" if price > avg else "BEAR"
+    market_state["structure"]["d1_bias"] = "BULL" if price > avg else "BEAR"   # temporary rule
     market_state["structure"]["playbook_mode"] = "NORMAL_BULL" if price > avg else "MIRROR_FLIP_BEAR"
 
-    # liquidity matrix
     ah, al = day["asian_high"], day["asian_low"]
     lm = market_state["liquidity_matrix"]
     lm["buyside"] = {"name": "Asian High", "price": round(ah, 2), "distance": round(abs(ah - price), 2) if ah else 0.0}
     lm["equilibrium"] = {"name": "SESSION AVG", "price": round(avg, 2), "distance": round(abs(avg - price), 2)}
     lm["sellside"] = {"name": "Asian Low", "price": round(al, 2), "distance": round(abs(al - price), 2) if al else 0.0}
 
-    # sweep -> displacement -> FVG, with memory
     if range_ready and ms in ("LONDON_OPEN_MACRO", "NY_OPEN_MACRO"):
         if price < al:
             day["swept"] = True
@@ -281,7 +321,7 @@ def engine_step():
                 "grade": "A+ [3/3 GATES MET]",
                 "entry": round(price, 2), "sl": round(sl, 2),
                 "tp": round(price + RR * risk, 2),
-                "risk_pct": 0.4, "lots": 0.0,  # lots: needs account size, set later
+                "risk_pct": 0.4, "lots": 0.0,
             }
             day["exec_ts"] = time.time()
             log("A+ setup latched:", market_state["execution"])
@@ -302,10 +342,12 @@ def engine_loop():
             engine_step()
             if time.time() - last_hb > 60:
                 last_hb = time.time()
-                log(f"heartbeat price={market_state['current_price']} src={feed['source']} "
-                    f"state={market_state['macro_state']} ticks={feed['ticks']}")
+                f = market_state["feed"]
+                log(f"heartbeat price={market_state['current_price']} src={f.get('source')} "
+                    f"proxy={f.get('proxy')} offset={f.get('offset')} state={market_state['macro_state']} "
+                    f"ticks={raw['ticks']}")
         except Exception as e:
-            log("Engine error:", type(e).__name__, e)
+            warn("engine", f"{type(e).__name__}: {e}", every=10)
             time.sleep(2)
         time.sleep(0.5)
 
@@ -314,6 +356,7 @@ def engine_loop():
 def ai_context():
     return {"clock_eat": (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%H:%M"),
             "price": market_state["current_price"],
+            "price_is_proxy": market_state["feed"].get("proxy"),
             "macro_state": market_state["macro_state"],
             "structure": market_state["structure"],
             "liquidity": market_state["liquidity_matrix"],
@@ -333,18 +376,49 @@ def get_ai_briefing():
         res = ai_client.models.generate_content(model=GEMINI_MODEL, contents=prompt,
                                                 config=types.GenerateContentConfig(temperature=0.1))
         text = res.text.strip()
-        text = text[text.find("{"):text.rfind("}") + 1]
-        return json.loads(text)
+        out = json.loads(text[text.find("{"):text.rfind("}") + 1])
+        return {"observation": str(out.get("observation", ""))[:400],
+                "inference": str(out.get("inference", ""))[:400],
+                "decision": str(out.get("decision", "WAIT")).upper()[:10]}
     except Exception as e:
-        log("AI briefing error:", type(e).__name__, e)
+        warn("ai", f"{type(e).__name__}: {str(e)[:100]}", every=120)
         return fallback
 
 
 def ai_loop():
     while True:
-        if market_state["feed"]["ok"]:
+        if market_state["feed"].get("ok"):
             market_state["ai_briefing"] = get_ai_briefing()
         time.sleep(20)
+
+
+# ------------------------------------------------------------------ OUTBOUND PROBE (diagnostics)
+PROBE_TARGETS = {
+    "google": "https://www.google.com/generate_204",
+    "binance-paxg": "https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT",
+    "kraken-paxg": "https://api.kraken.com/0/public/Ticker?pair=PAXGUSD",
+    "twelvedata": "https://api.twelvedata.com/price?symbol=XAU/USD",
+}
+probe_results = {}
+
+
+def _probe_one(name, url):
+    t0 = time.time()
+    try:
+        r = requests.get(url, timeout=(5, 8), headers={"User-Agent": "Mozilla/5.0"})
+        probe_results[name] = {"ok": True, "status": r.status_code, "ms": int((time.time() - t0) * 1000),
+                               "sample": r.text[:80].replace("\n", " ")}
+    except Exception as e:
+        probe_results[name] = {"ok": False, "ms": int((time.time() - t0) * 1000),
+                               "problem": f"{type(e).__name__}: {str(e)[:90]}"}
+
+
+def run_probe():
+    ts = [threading.Thread(target=_probe_one, args=(n, u), daemon=True) for n, u in PROBE_TARGETS.items()]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(timeout=15)
 
 
 # ------------------------------------------------------------------ ROUTES
@@ -362,21 +436,24 @@ def get_market_data():
 def debug():
     return jsonify({
         "uptime_sec": int(time.time() - STARTED),
-        "feed": {**feed, "age_sec": round(time.time() - feed["ts"], 1) if feed["ts"] else None},
+        "raw_feed": {**raw, "age_sec": round(time.time() - raw["ts"], 1) if raw["ts"] else None},
+        "output": market_state["feed"],
+        "calibration": {**cal, "age_sec": round(time.time() - cal["ts"], 1) if cal["ts"] else None},
+        "source_problems": feed_err,
         "threads": {t.name: t.is_alive() for t in threading.enumerate()},
         "candles": len(candles),
         "day": {k: day[k] for k in ("date", "asian_high", "asian_low", "n", "swept", "displaced", "fvg")},
-        "gemini_key_set": bool(GEMINI_API_KEY),
-        "twelvedata_key_set": bool(TWELVEDATA_API_KEY),
+        "keys": {"gemini": bool(GEMINI_API_KEY), "twelvedata": bool(TWELVEDATA_API_KEY)},
         "gemini_model": GEMINI_MODEL,
+        "deriv_enabled": ENABLE_DERIV,
     })
-
 
 
 @app.route("/api/v1/probe")
 def probe():
     run_probe()
     return jsonify(probe_results)
+
 
 @app.route("/api/v1/chat", methods=["POST"])
 def chat():
@@ -393,29 +470,8 @@ def chat():
         res = ai_client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
         return jsonify({"reply": res.text.strip()})
     except Exception as e:
-        log("Chat error:", type(e).__name__, e)
-        return jsonify({"reply": f"AI core error ({type(e).__name__}). Check model name / key."}), 502
-
-
-@app.route("/api/v1/tick", methods=["POST"])
-def browser_tick():
-    """Price pushed by the dashboard itself (the phone's browser can reach Deriv even when Render cannot).
-    Only used while no server-side feed is live. NOTE: anyone can post here - fine while execution is OFF,
-    must be locked down before any real orders exist."""
-    d = request.get_json(silent=True) or {}
-    try:
-        p = float(d.get("price"))
-    except (TypeError, ValueError):
-        return jsonify({"ok": False, "error": "bad price"}), 400
-    if not (1000 < p < 20000):
-        return jsonify({"ok": False, "error": "price out of range"}), 400
-    prev = feed["price"]
-    if prev and abs(p - prev) / prev > 0.05:
-        return jsonify({"ok": False, "error": "jump too large"}), 400
-    if feed["source"] in ("deriv", "gold-api") and time.time() - feed["ts"] < 8:
-        return jsonify({"ok": True, "used": False})
-    set_price(p, "browser")
-    return jsonify({"ok": True, "used": True})
+        warn("chat", f"{type(e).__name__}: {str(e)[:100]}", every=30)
+        return jsonify({"reply": f"AI core problem ({type(e).__name__}). Check GEMINI_MODEL / key."}), 502
 
 
 def _disabled():
@@ -434,9 +490,18 @@ def campaign_action():
 
 
 # ------------------------------------------------------------------ BOOT
-if __name__ == "__main__":
-    log("Starting ST-FIRM backend (phase 1)")
-    threading.Thread(target=run_probe, name="probe", daemon=True).start()  # results appear in Render logs
-    for fn, name in ((start_deriv, "deriv"), (rest_fallback, "rest"), (engine_loop, "engine"), (ai_loop, "ai")):
+def start_threads():
+    specs = [(poll_binance, "binance"), (poll_kraken, "kraken"), (calibrate_loop, "calibrate"),
+             (engine_loop, "engine"), (ai_loop, "ai")]
+    if ENABLE_DERIV:
+        specs.append((start_deriv, "deriv"))
+    if PROBE_ON_START:
+        specs.append((run_probe, "probe"))
+    for fn, name in specs:
         threading.Thread(target=fn, name=name, daemon=True).start()
+
+
+if __name__ == "__main__":
+    log("Starting ST-FIRM backend v2")
+    start_threads()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), threaded=True)
