@@ -1,200 +1,359 @@
+"""
+ST-FIRM WATCHER backend  --  Phase 1
+- Price feed that tells you WHY it has no price (see /api/v1/debug)
+- Every log line is flushed, so Render shows errors immediately
+- Engine, AI and feeds each run in their own thread (AI can no longer freeze prices)
+- Asian range + session average reset every EAT day
+- Sweep -> displacement -> FVG is now a real sequence with memory (1-minute candles built from ticks)
+- /chat works; /trade and /campaign/action are SAFE STUBS (analysis only, no orders)
+"""
+import os
+import json
+import time
+import asyncio
+import threading
+from datetime import datetime, timedelta, timezone
+
+import requests
+import websockets
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import threading
-import time
-import os
-import asyncio
-import json
-import websockets
-import requests
-import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta, timezone
 from google import genai
 from google.genai import types
 
 app = Flask(__name__)
-CORS(app)
+CORS(app)  # TODO before execution exists: restrict to your Vercel domain
 
-# --- CONFIGURATION ---
+# ------------------------------------------------------------------ CONFIG
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-DERIV_TOKEN = os.environ.get("DERIV_TOKEN")
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-DERIV_APP_ID = "1089"
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")  # change in Render env if Google renames it
+DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "1089")
 
+ASIAN_START, ASIAN_END = 0.0, 9.0   # EAT hours, same as your original
+SWEEP_DISPLACEMENT = 2.0            # points above Asian low = displacement
+SL_BUFFER = 3.5                     # points under the sweep low
+RR = 2.0                            # take-profit = entry + RR * risk
+SETUP_LIFETIME = 30 * 60            # seconds an A+ setup stays on screen
+
+ai_client = None
 if GEMINI_API_KEY:
     ai_client = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=30000))
-else:
-    ai_client = None
 
-# --- STATE ---
+
+def log(*a):
+    print(*a, flush=True)
+
+
+# ------------------------------------------------------------------ STATE
+STARTED = time.time()
+
+feed = {"price": None, "source": None, "ts": 0.0, "ticks": 0,
+        "deriv_error": None, "rest_error": None}
+
 market_state = {
     "current_price": "0.00",
     "macro_state": "HIBERNATION",
-    "structure": {"d1_bias": "WAIT", "h4_bias": "WAIT", "h1_bias": "WAIT", "playbook_mode": "NORMAL_BULL", "zone": "EQUILIBRIUM"},
+    "structure": {"d1_bias": "WAIT", "h4_bias": "WAIT", "h1_bias": "WAIT",
+                  "playbook_mode": "NORMAL_BULL", "zone": "EQUILIBRIUM"},
     "liquidity_matrix": {
         "buyside": {"name": "Asian High", "price": 0.0, "distance": 0.0},
-        "equilibrium": {"name": "VWAP", "price": 0.0, "distance": 0.0},
-        "sellside": {"name": "Asian Low", "price": 0.0, "distance": 0.0}
+        "equilibrium": {"name": "SESSION AVG", "price": 0.0, "distance": 0.0},
+        "sellside": {"name": "Asian Low", "price": 0.0, "distance": 0.0},
     },
     "checklist": {"sweep": False, "displacement": False, "fvg": False},
     "execution": {"grade": "WAITING", "entry": 0.0, "sl": 0.0, "tp": 0.0, "risk_pct": 1.0, "lots": 0.0},
     "ai_briefing": {"observation": "Initializing...", "inference": "Initializing...", "decision": "WAIT"},
-    "session_history": []
+    "feed": {"ok": False, "source": None, "age_sec": None},
+    "range_ready": False,
+    "uptime_sec": 0,
+    "session_history": [],
 }
 
-gold_prices = []
-asian_high, asian_low = 0.0, 0.0
-daily_risk_used = 0.0
-last_reset_date = ""
-last_ai_update = 0
-latest_tick = None
-last_tick_time = 0
+day = {"date": "", "asian_high": 0.0, "asian_low": 0.0, "sum": 0.0, "n": 0,
+       "swept": False, "sweep_low": None, "displaced": False, "fvg": False, "exec_ts": 0.0}
 
-def calculate_vwap(prices):
-    if not prices: return 0.0
-    return sum(prices) / len(prices)
+candles = []  # 1-minute candles built from ticks
 
-# --- LIVE DERIV WEBSOCKET STREAM ---
+
+def set_price(p, source):
+    feed["price"] = p
+    feed["source"] = source
+    feed["ts"] = time.time()
+    feed["ticks"] += 1
+
+
+def update_candles(price, now_ts):
+    minute = int(now_ts // 60)
+    if candles and candles[-1]["m"] == minute:
+        c = candles[-1]
+        c["h"] = max(c["h"], price)
+        c["l"] = min(c["l"], price)
+        c["c"] = price
+    else:
+        candles.append({"m": minute, "o": price, "h": price, "l": price, "c": price})
+        if len(candles) > 120:
+            candles.pop(0)
+
+
+def bullish_fvg():
+    """Last 3 CLOSED candles: gap between candle1 high and candle3 low."""
+    if len(candles) < 4:
+        return False
+    c1, c3 = candles[-4], candles[-2]
+    return c3["l"] > c1["h"]
+
+
+# ------------------------------------------------------------------ PRICE FEEDS
 async def deriv_stream():
-    global latest_tick, last_tick_time
     url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
     while True:
         try:
-            async with websockets.connect(url, ping_interval=10) as ws:
+            async with websockets.connect(url, ping_interval=20, open_timeout=15) as ws:
                 await ws.send(json.dumps({"ticks": "frxXAUUSD", "subscribe": 1}))
+                log("Deriv: connected, subscribed to frxXAUUSD")
                 while True:
-                    msg = await ws.recv()
-                    data = json.loads(msg)
-                    if 'tick' in data:
-                        latest_tick = float(data['tick']['quote'])
-                        last_tick_time = time.time()
+                    data = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
+                    if "error" in data:
+                        raise RuntimeError(data["error"].get("message", "deriv error"))
+                    if "tick" in data:
+                        set_price(float(data["tick"]["quote"]), "deriv")
+                        feed["deriv_error"] = None
         except Exception as e:
-            print(f"Deriv Stream Error: {e}")
-            await asyncio.sleep(3)
+            feed["deriv_error"] = f"{type(e).__name__}: {e}"
+            log("Deriv stream error:", feed["deriv_error"])
+            await asyncio.sleep(5)
 
-def start_stream():
+
+def start_deriv():
     asyncio.run(deriv_stream())
 
-# --- OVERLORD AI ---
-def get_ai_briefing():
-    fallback = {
-        "observation": f"Price at {market_state['current_price']}. Bias: {market_state['structure']['d1_bias']}. Waiting for setup.",
-        "inference": "Analyzing market structure and waiting for trigger conditions.",
-        "decision": "WAIT"
-    }
-    if not ai_client: return fallback
-    payload = {
-        "clock": (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%H:%M"),
-        "price": market_state["current_price"],
-        "structure": market_state["structure"],
-        "triggers": market_state["checklist"]
-    }
-    sys_prompt = f"""
-    You are Overlord AI. Analyze this data: {json.dumps(payload)}
-    Respond STRICTLY in JSON format: {{"observation": "text", "inference": "text", "decision": "BUY/SELL/WAIT"}}
-    """
-    try:
-        res = ai_client.models.generate_content(
-            model="gemini-1.5-flash", 
-            contents=sys_prompt, 
-            config=types.GenerateContentConfig(temperature=0.1)
-        )
-        text = res.text.strip()
-        if "{" in text and "}" in text:
-            text = text[text.find("{"):text.rfind("}")+1]
-        return json.loads(text)
-    except Exception as e:
-        print(f"AI Error: {e}")
-        return fallback
 
-# --- THE CORE ENGINE ---
-def main_loop():
-    global asian_high, asian_low, daily_risk_used, last_reset_date, last_ai_update, latest_tick
-    
-    print("🚀 Starting Live Engine...")
-    
+def rest_fallback():
+    """Only runs when Deriv has been silent for 5s. Polls gently."""
     while True:
         try:
-            # 1. PRICE FETCH: Use Deriv WebSocket if active, else fallback to Gold-API
-            if latest_tick and (time.time() - last_tick_time < 5):
-                gold_price = latest_tick
-            else:
-                # Fallback to Gold-API (Correct XAUUSD price, not PAXG)
-                res = requests.get("https://api.gold-api.com/price/XAU", timeout=5).json()
-                gold_price = float(res['price'])
-            
-            gold_prices.append(gold_price)
-            if len(gold_prices) > 100: gold_prices.pop(0)
-            market_state["current_price"] = str(round(gold_price, 2))
-            
-            # 2. Time & Daily Reset
-            now_eat = datetime.now(timezone.utc) + timedelta(hours=3)
-            eat_str = now_eat.strftime("%Y-%m-%d")
-            eat_hour = now_eat.hour + (now_eat.minute / 60.0)
-            
-            if eat_str != last_reset_date and eat_hour >= 3.0:
-                last_reset_date = eat_str
-                daily_risk_used = 0.0
-                market_state["session_history"] = []
-                market_state["structure"]["d1_bias"] = "BULL" if gold_price > calculate_vwap(gold_prices) else "BEAR"
-                market_state["structure"]["playbook_mode"] = "NORMAL_BULL" if market_state["structure"]["d1_bias"] == "BULL" else "MIRROR_FLIP_BEAR"
-
-            # 3. State Machine
-            if 4.0 <= eat_hour < 4.75: market_state["macro_state"] = "ASIAN_JUDAS_WINDOW"
-            elif 6.0 <= eat_hour < 7.0: market_state["macro_state"] = "DOCK_1_RECOVERY_WINDOW"
-            elif 10.0 <= eat_hour < 11.5: market_state["macro_state"] = "LONDON_OPEN_MACRO"
-            elif 15.5 <= eat_hour < 17.0: market_state["macro_state"] = "NY_OPEN_MACRO"
-            elif 17.0 <= eat_hour < 19.0: market_state["macro_state"] = "PM_DISTRIBUTION_WALL"
-            else: market_state["macro_state"] = "HIBERNATION"
-
-            # 4. Asian Range
-            if 0.0 <= eat_hour < 9.0:
-                if asian_high == 0.0 or gold_price > asian_high: asian_high = gold_price
-                if asian_low == 0.0 or gold_price < asian_low: asian_low = gold_price
-                
-            if asian_low == 0.0: asian_low = gold_price - 10.0
-            if asian_high == 0.0: asian_high = gold_price + 10.0
-
-            # 5. Liquidity Matrix
-            vwap = calculate_vwap(gold_prices)
-            market_state["liquidity_matrix"]["buyside"] = {"name": "Asian High", "price": round(asian_high, 2), "distance": round(abs(asian_high - gold_price), 2)}
-            market_state["liquidity_matrix"]["equilibrium"] = {"name": "VWAP", "price": round(vwap, 2), "distance": round(abs(vwap - gold_price), 2)}
-            market_state["liquidity_matrix"]["sellside"] = {"name": "Asian Low", "price": round(asian_low, 2), "distance": round(abs(asian_low - gold_price), 2)}
-
-            # 6. Checklist & Execution
-            dist_to_low = abs(gold_price - asian_low)
-            market_state["checklist"] = {"sweep": False, "displacement": False, "fvg": False}
-            
-            if market_state["macro_state"] in ["LONDON_OPEN_MACRO", "DOCK_1_RECOVERY_WINDOW"]:
-                if dist_to_low <= 1.5:
-                    market_state["checklist"]["sweep"] = True
-                if market_state["checklist"]["sweep"] and gold_price > asian_low + 2.0:
-                    market_state["checklist"]["displacement"] = True
-                    market_state["checklist"]["fvg"] = True
-                    market_state["execution"] = {
-                        "grade": "A+ [3/3 GATES MET]",
-                        "entry": round(gold_price, 2),
-                        "sl": round(asian_low - 3.5, 2),
-                        "tp": round(vwap, 2),
-                        "risk_pct": 0.4,
-                        "lots": 0.15
-                    }
-            
-            # 7. AI Eval
-            if time.time() - last_ai_update > 15:
-                market_state["ai_briefing"] = get_ai_briefing()
-                last_ai_update = time.time()
-
+            if time.time() - feed["ts"] > 5:
+                r = requests.get("https://api.gold-api.com/price/XAU", timeout=(3, 5))
+                r.raise_for_status()
+                set_price(float(r.json()["price"]), "gold-api")
+                feed["rest_error"] = None
         except Exception as e:
-            print(f"Engine Error: {e}")
-            
-        time.sleep(0.2) # SUPER FAST REFRESH
+            feed["rest_error"] = f"{type(e).__name__}: {e}"
+            log("REST fallback error:", feed["rest_error"])
+        time.sleep(3)
 
-@app.route('/api/v1/market/xauusd')
-def get_market_data(): return jsonify(market_state)
 
-if __name__ == '__main__':
-    threading.Thread(target=start_stream, daemon=True).start()
-    threading.Thread(target=main_loop, daemon=True).start()
-    app.run(host='0.0.0.0', port=10000)
+# ------------------------------------------------------------------ ENGINE
+def reset_day(date_str):
+    day.update({"date": date_str, "asian_high": 0.0, "asian_low": 0.0, "sum": 0.0, "n": 0,
+                "swept": False, "sweep_low": None, "displaced": False, "fvg": False, "exec_ts": 0.0})
+    market_state["execution"] = {"grade": "WAITING", "entry": 0.0, "sl": 0.0, "tp": 0.0,
+                                 "risk_pct": 1.0, "lots": 0.0}
+    market_state["session_history"] = []
+    log("New EAT day:", date_str, "- ranges reset")
+
+
+def engine_step():
+    now = datetime.now(timezone.utc) + timedelta(hours=3)
+    date_str = now.strftime("%Y-%m-%d")
+    h = now.hour + now.minute / 60.0
+
+    age = time.time() - feed["ts"] if feed["ts"] else None
+    fresh = age is not None and age < 30
+    market_state["feed"] = {"ok": fresh, "source": feed["source"],
+                            "age_sec": round(age, 1) if age is not None else None}
+    market_state["uptime_sec"] = int(time.time() - STARTED)
+    if not fresh:
+        return
+    price = feed["price"]
+
+    if date_str != day["date"]:
+        reset_day(date_str)
+
+    market_state["current_price"] = str(round(price, 2))
+    update_candles(price, time.time())
+    day["sum"] += price
+    day["n"] += 1
+    avg = day["sum"] / day["n"]  # session AVERAGE price (no volume in this feed, so not true VWAP)
+
+    # macro state (unchanged windows)
+    if 4.0 <= h < 4.75:
+        ms = "ASIAN_JUDAS_WINDOW"
+    elif 6.0 <= h < 7.0:
+        ms = "DOCK_1_RECOVERY_WINDOW"
+    elif 10.0 <= h < 11.5:
+        ms = "LONDON_OPEN_MACRO"
+    elif 15.5 <= h < 17.0:
+        ms = "NY_OPEN_MACRO"
+    elif 17.0 <= h < 19.0:
+        ms = "PM_DISTRIBUTION_WALL"
+    else:
+        ms = "HIBERNATION"
+    market_state["macro_state"] = ms
+
+    # Asian range builds 00:00-09:00 EAT, then freezes
+    if ASIAN_START <= h < ASIAN_END:
+        if day["asian_high"] == 0.0 or price > day["asian_high"]:
+            day["asian_high"] = price
+        if day["asian_low"] == 0.0 or price < day["asian_low"]:
+            day["asian_low"] = price
+    range_ready = h >= ASIAN_END and day["asian_low"] > 0.0
+    market_state["range_ready"] = range_ready
+
+    # bias (temporary): price vs session average
+    market_state["structure"]["d1_bias"] = "BULL" if price > avg else "BEAR"
+    market_state["structure"]["playbook_mode"] = "NORMAL_BULL" if price > avg else "MIRROR_FLIP_BEAR"
+
+    # liquidity matrix
+    ah, al = day["asian_high"], day["asian_low"]
+    lm = market_state["liquidity_matrix"]
+    lm["buyside"] = {"name": "Asian High", "price": round(ah, 2), "distance": round(abs(ah - price), 2) if ah else 0.0}
+    lm["equilibrium"] = {"name": "SESSION AVG", "price": round(avg, 2), "distance": round(abs(avg - price), 2)}
+    lm["sellside"] = {"name": "Asian Low", "price": round(al, 2), "distance": round(abs(al - price), 2) if al else 0.0}
+
+    # sweep -> displacement -> FVG, with memory
+    if range_ready and ms in ("LONDON_OPEN_MACRO", "NY_OPEN_MACRO"):
+        if price < al:
+            day["swept"] = True
+            day["sweep_low"] = price if day["sweep_low"] is None else min(day["sweep_low"], price)
+        if day["swept"] and price > al + SWEEP_DISPLACEMENT:
+            day["displaced"] = True
+        if day["swept"] and bullish_fvg():
+            day["fvg"] = True
+        if day["swept"] and day["displaced"] and day["fvg"] and day["exec_ts"] == 0.0:
+            sl = min(day["sweep_low"], al) - SL_BUFFER
+            risk = price - sl
+            market_state["execution"] = {
+                "grade": "A+ [3/3 GATES MET]",
+                "entry": round(price, 2), "sl": round(sl, 2),
+                "tp": round(price + RR * risk, 2),
+                "risk_pct": 0.4, "lots": 0.0,  # lots: needs account size, set later
+            }
+            day["exec_ts"] = time.time()
+            log("A+ setup latched:", market_state["execution"])
+
+    if day["exec_ts"] and time.time() - day["exec_ts"] > SETUP_LIFETIME:
+        day.update({"swept": False, "sweep_low": None, "displaced": False, "fvg": False, "exec_ts": 0.0})
+        market_state["execution"] = {"grade": "WAITING", "entry": 0.0, "sl": 0.0, "tp": 0.0,
+                                     "risk_pct": 1.0, "lots": 0.0}
+
+    market_state["checklist"] = {"sweep": day["swept"], "displacement": day["displaced"], "fvg": day["fvg"]}
+
+
+def engine_loop():
+    last_hb = 0
+    log("Engine thread started")
+    while True:
+        try:
+            engine_step()
+            if time.time() - last_hb > 60:
+                last_hb = time.time()
+                log(f"heartbeat price={market_state['current_price']} src={feed['source']} "
+                    f"state={market_state['macro_state']} ticks={feed['ticks']}")
+        except Exception as e:
+            log("Engine error:", type(e).__name__, e)
+            time.sleep(2)
+        time.sleep(0.5)
+
+
+# ------------------------------------------------------------------ AI
+def ai_context():
+    return {"clock_eat": (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%H:%M"),
+            "price": market_state["current_price"],
+            "macro_state": market_state["macro_state"],
+            "structure": market_state["structure"],
+            "liquidity": market_state["liquidity_matrix"],
+            "checklist": market_state["checklist"],
+            "execution": market_state["execution"]}
+
+
+def get_ai_briefing():
+    fallback = {"observation": f"Price {market_state['current_price']}. State {market_state['macro_state']}.",
+                "inference": "AI offline or waiting for data.", "decision": "WAIT"}
+    if not ai_client:
+        return fallback
+    prompt = ("You are the analysis assistant of a gold dashboard. Use ONLY this data, never invent levels. "
+              f"DATA: {json.dumps(ai_context())}\n"
+              'Reply ONLY JSON: {"observation": "...", "inference": "...", "decision": "BUY/SELL/WAIT"}')
+    try:
+        res = ai_client.models.generate_content(model=GEMINI_MODEL, contents=prompt,
+                                                config=types.GenerateContentConfig(temperature=0.1))
+        text = res.text.strip()
+        text = text[text.find("{"):text.rfind("}") + 1]
+        return json.loads(text)
+    except Exception as e:
+        log("AI briefing error:", type(e).__name__, e)
+        return fallback
+
+
+def ai_loop():
+    while True:
+        if market_state["feed"]["ok"]:
+            market_state["ai_briefing"] = get_ai_briefing()
+        time.sleep(20)
+
+
+# ------------------------------------------------------------------ ROUTES
+@app.route("/")
+def root():
+    return "ST-FIRM backend OK", 200
+
+
+@app.route("/api/v1/market/xauusd")
+def get_market_data():
+    return jsonify(market_state)
+
+
+@app.route("/api/v1/debug")
+def debug():
+    return jsonify({
+        "uptime_sec": int(time.time() - STARTED),
+        "feed": {**feed, "age_sec": round(time.time() - feed["ts"], 1) if feed["ts"] else None},
+        "threads": {t.name: t.is_alive() for t in threading.enumerate()},
+        "candles": len(candles),
+        "day": {k: day[k] for k in ("date", "asian_high", "asian_low", "n", "swept", "displaced", "fvg")},
+        "gemini_key_set": bool(GEMINI_API_KEY),
+        "gemini_model": GEMINI_MODEL,
+    })
+
+
+@app.route("/api/v1/chat", methods=["POST"])
+def chat():
+    msg = str((request.get_json(silent=True) or {}).get("message", "")).strip()[:1000]
+    if not msg:
+        return jsonify({"reply": "Type a question first."}), 400
+    if not ai_client:
+        return jsonify({"reply": "AI core is offline: GEMINI_API_KEY is not set on the server."})
+    prompt = ("You are the assistant of a gold (XAUUSD) dashboard. Answer using ONLY the live data below; "
+              "if it is not in the data, say you don't have it. Be brief. This is analysis, not financial advice, "
+              "and never promise outcomes.\n"
+              f"DATA: {json.dumps(ai_context())}\nUSER: {msg}")
+    try:
+        res = ai_client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+        return jsonify({"reply": res.text.strip()})
+    except Exception as e:
+        log("Chat error:", type(e).__name__, e)
+        return jsonify({"reply": f"AI core error ({type(e).__name__}). Check model name / key."}), 502
+
+
+def _disabled():
+    return jsonify({"status": "disabled",
+                    "message": "Execution is OFF. This build is analysis-only; no orders are sent."})
+
+
+@app.route("/api/v1/trade", methods=["POST"])
+def trade():
+    return _disabled()
+
+
+@app.route("/api/v1/campaign/action", methods=["POST"])
+def campaign_action():
+    return _disabled()
+
+
+# ------------------------------------------------------------------ BOOT
+if __name__ == "__main__":
+    log("Starting ST-FIRM backend (phase 1)")
+    for fn, name in ((start_deriv, "deriv"), (rest_fallback, "rest"), (engine_loop, "engine"), (ai_loop, "ai")):
+        threading.Thread(target=fn, name=name, daemon=True).start()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), threaded=True)
