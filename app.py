@@ -28,6 +28,8 @@ CORS(app)  # TODO before execution exists: restrict to your Vercel domain
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")  # change in Render env if Google renames it
 DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "1089")
+DERIV_HOSTS = ["ws.derivws.com", "ws.binaryws.com"]        # tried in turn if one is rejected
+TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY")  # free key: 800 calls/day -> polled every 2 min (DELAYED)
 
 ASIAN_START, ASIAN_END = 0.0, 9.0   # EAT hours, same as your original
 SWEEP_DISPLACEMENT = 2.0            # points above Asian low = displacement
@@ -47,8 +49,8 @@ def log(*a):
 # ------------------------------------------------------------------ STATE
 STARTED = time.time()
 
-feed = {"price": None, "source": None, "ts": 0.0, "ticks": 0,
-        "deriv_error": None, "rest_error": None}
+feed = {"price": None, "source": None, "ts": 0.0, "ticks": 0, "delayed": False,
+        "deriv_error": None, "gold_api_error": None, "twelvedata_error": None}
 
 market_state = {
     "current_price": "0.00",
@@ -75,9 +77,10 @@ day = {"date": "", "asian_high": 0.0, "asian_low": 0.0, "sum": 0.0, "n": 0,
 candles = []  # 1-minute candles built from ticks
 
 
-def set_price(p, source):
+def set_price(p, source, delayed=False):
     feed["price"] = p
     feed["source"] = source
+    feed["delayed"] = delayed
     feed["ts"] = time.time()
     feed["ticks"] += 1
 
@@ -105,12 +108,14 @@ def bullish_fvg():
 
 # ------------------------------------------------------------------ PRICE FEEDS
 async def deriv_stream():
-    url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+    i = 0
     while True:
+        host = DERIV_HOSTS[i % len(DERIV_HOSTS)]
+        url = f"wss://{host}/websockets/v3?app_id={DERIV_APP_ID}"
         try:
             async with websockets.connect(url, ping_interval=20, open_timeout=15) as ws:
                 await ws.send(json.dumps({"ticks": "frxXAUUSD", "subscribe": 1}))
-                log("Deriv: connected, subscribed to frxXAUUSD")
+                log(f"Deriv: connected to {host}, subscribed to frxXAUUSD")
                 while True:
                     data = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
                     if "error" in data:
@@ -119,9 +124,10 @@ async def deriv_stream():
                         set_price(float(data["tick"]["quote"]), "deriv")
                         feed["deriv_error"] = None
         except Exception as e:
-            feed["deriv_error"] = f"{type(e).__name__}: {e}"
+            feed["deriv_error"] = f"{host}: {type(e).__name__}: {e}"
             log("Deriv stream error:", feed["deriv_error"])
-            await asyncio.sleep(5)
+            i += 1
+            await asyncio.sleep(10)
 
 
 def start_deriv():
@@ -129,18 +135,33 @@ def start_deriv():
 
 
 def rest_fallback():
-    """Only runs when Deriv has been silent for 5s. Polls gently."""
+    """Runs only while the Deriv stream is silent. Backs off when a source keeps failing."""
+    last_td = 0.0
     while True:
-        try:
-            if time.time() - feed["ts"] > 5:
+        wait = 3
+        if time.time() - feed["ts"] > 8 or feed["delayed"]:
+            try:
                 r = requests.get("https://api.gold-api.com/price/XAU", timeout=(3, 5))
                 r.raise_for_status()
                 set_price(float(r.json()["price"]), "gold-api")
-                feed["rest_error"] = None
-        except Exception as e:
-            feed["rest_error"] = f"{type(e).__name__}: {e}"
-            log("REST fallback error:", feed["rest_error"])
-        time.sleep(3)
+                feed["gold_api_error"] = None
+            except Exception as e:
+                feed["gold_api_error"] = f"{type(e).__name__}: {str(e)[:120]}"
+                log("gold-api error:", feed["gold_api_error"])
+                wait = 15  # don't hammer a source that is down
+                # last resort: Twelve Data free tier, once per 2 min (800 calls/day cap)
+                if TWELVEDATA_API_KEY and time.time() - last_td > 120 and time.time() - feed["ts"] > 8:
+                    last_td = time.time()
+                    try:
+                        r = requests.get("https://api.twelvedata.com/price",
+                                         params={"symbol": "XAU/USD", "apikey": TWELVEDATA_API_KEY}, timeout=(3, 6))
+                        r.raise_for_status()
+                        set_price(float(r.json()["price"]), "twelvedata", delayed=True)
+                        feed["twelvedata_error"] = None
+                    except Exception as e2:
+                        feed["twelvedata_error"] = f"{type(e2).__name__}: {str(e2)[:120]}"
+                        log("twelvedata error:", feed["twelvedata_error"])
+        time.sleep(wait)
 
 
 # ------------------------------------------------------------------ ENGINE
@@ -159,8 +180,8 @@ def engine_step():
     h = now.hour + now.minute / 60.0
 
     age = time.time() - feed["ts"] if feed["ts"] else None
-    fresh = age is not None and age < 30
-    market_state["feed"] = {"ok": fresh, "source": feed["source"],
+    fresh = age is not None and age < (300 if feed["delayed"] else 30)
+    market_state["feed"] = {"ok": fresh, "source": feed["source"], "delayed": feed["delayed"],
                             "age_sec": round(age, 1) if age is not None else None}
     market_state["uptime_sec"] = int(time.time() - STARTED)
     if not fresh:
@@ -313,6 +334,7 @@ def debug():
         "candles": len(candles),
         "day": {k: day[k] for k in ("date", "asian_high", "asian_low", "n", "swept", "displaced", "fvg")},
         "gemini_key_set": bool(GEMINI_API_KEY),
+        "twelvedata_key_set": bool(TWELVEDATA_API_KEY),
         "gemini_model": GEMINI_MODEL,
     })
 
