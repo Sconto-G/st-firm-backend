@@ -164,6 +164,39 @@ def rest_fallback():
         time.sleep(wait)
 
 
+
+# ------------------------------------------------------------------ OUTBOUND PROBE
+PROBE_TARGETS = {
+    "google": "https://www.google.com/generate_204",
+    "gold-api": "https://api.gold-api.com/price/XAU",
+    "twelvedata": "https://api.twelvedata.com/price?symbol=XAU/USD",   # 401 without key = reachable
+    "deriv-http": "https://ws.derivws.com/",
+    "stooq-xauusd": "https://stooq.com/q/l/?s=xauusd&f=sd2t2c&h&e=csv",
+    "kraken-paxg": "https://api.kraken.com/0/public/Ticker?pair=PAXGUSD",
+    "binance-paxg": "https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT",
+}
+probe_results = {}
+
+
+def _probe_one(name, url):
+    t0 = time.time()
+    try:
+        r = requests.get(url, timeout=(5, 8), headers={"User-Agent": "Mozilla/5.0"})
+        probe_results[name] = {"ok": True, "status": r.status_code, "ms": int((time.time() - t0) * 1000),
+                               "sample": r.text[:80].replace("\n", " ")}
+    except Exception as e:
+        probe_results[name] = {"ok": False, "ms": int((time.time() - t0) * 1000),
+                               "error": f"{type(e).__name__}: {str(e)[:90]}"}
+    log("PROBE", name, probe_results[name])
+
+
+def run_probe():
+    ts = [threading.Thread(target=_probe_one, args=(n, u), daemon=True) for n, u in PROBE_TARGETS.items()]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(timeout=15)
+
 # ------------------------------------------------------------------ ENGINE
 def reset_day(date_str):
     day.update({"date": date_str, "asian_high": 0.0, "asian_low": 0.0, "sum": 0.0, "n": 0,
@@ -339,6 +372,12 @@ def debug():
     })
 
 
+
+@app.route("/api/v1/probe")
+def probe():
+    run_probe()
+    return jsonify(probe_results)
+
 @app.route("/api/v1/chat", methods=["POST"])
 def chat():
     msg = str((request.get_json(silent=True) or {}).get("message", "")).strip()[:1000]
@@ -356,6 +395,27 @@ def chat():
     except Exception as e:
         log("Chat error:", type(e).__name__, e)
         return jsonify({"reply": f"AI core error ({type(e).__name__}). Check model name / key."}), 502
+
+
+@app.route("/api/v1/tick", methods=["POST"])
+def browser_tick():
+    """Price pushed by the dashboard itself (the phone's browser can reach Deriv even when Render cannot).
+    Only used while no server-side feed is live. NOTE: anyone can post here - fine while execution is OFF,
+    must be locked down before any real orders exist."""
+    d = request.get_json(silent=True) or {}
+    try:
+        p = float(d.get("price"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "bad price"}), 400
+    if not (1000 < p < 20000):
+        return jsonify({"ok": False, "error": "price out of range"}), 400
+    prev = feed["price"]
+    if prev and abs(p - prev) / prev > 0.05:
+        return jsonify({"ok": False, "error": "jump too large"}), 400
+    if feed["source"] in ("deriv", "gold-api") and time.time() - feed["ts"] < 8:
+        return jsonify({"ok": True, "used": False})
+    set_price(p, "browser")
+    return jsonify({"ok": True, "used": True})
 
 
 def _disabled():
@@ -376,6 +436,7 @@ def campaign_action():
 # ------------------------------------------------------------------ BOOT
 if __name__ == "__main__":
     log("Starting ST-FIRM backend (phase 1)")
+    threading.Thread(target=run_probe, name="probe", daemon=True).start()  # results appear in Render logs
     for fn, name in ((start_deriv, "deriv"), (rest_fallback, "rest"), (engine_loop, "engine"), (ai_loop, "ai")):
         threading.Thread(target=fn, name=name, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), threaded=True)
