@@ -44,67 +44,56 @@ market_state = {
 }
 
 gold_prices = []
-silver_prices = []
 asian_high, asian_low = 0.0, 0.0
 daily_risk_used = 0.0
 last_reset_date = ""
 last_ai_update = 0
-last_trap_lock_time = 0
 latest_tick = None
-
-def send_telegram_alert(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}, timeout=5)
-    except: pass
+last_tick_time = 0
 
 def calculate_vwap(prices):
     if not prices: return 0.0
     return sum(prices) / len(prices)
 
-# --- LIVE DERIV WEBSOCKET STREAM (FAST DATA) ---
+# --- LIVE DERIV WEBSOCKET STREAM ---
 async def deriv_stream():
-    global latest_tick
+    global latest_tick, last_tick_time
     url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
     while True:
         try:
-            async with websockets.connect(url) as ws:
+            async with websockets.connect(url, ping_interval=10) as ws:
                 await ws.send(json.dumps({"ticks": "frxXAUUSD", "subscribe": 1}))
                 while True:
                     msg = await ws.recv()
                     data = json.loads(msg)
                     if 'tick' in data:
                         latest_tick = float(data['tick']['quote'])
+                        last_tick_time = time.time()
         except Exception as e:
             print(f"Deriv Stream Error: {e}")
-            await asyncio.sleep(5)
+            await asyncio.sleep(3)
 
 def start_stream():
     asyncio.run(deriv_stream())
 
-# --- OVERLORD AI WITH FAIL-SAFE ---
+# --- OVERLORD AI ---
 def get_ai_briefing():
     fallback = {
         "observation": f"Price at {market_state['current_price']}. Bias: {market_state['structure']['d1_bias']}. Waiting for setup.",
         "inference": "Analyzing market structure and waiting for trigger conditions.",
         "decision": "WAIT"
     }
-    
     if not ai_client: return fallback
-    
     payload = {
         "clock": (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%H:%M"),
         "price": market_state["current_price"],
         "structure": market_state["structure"],
         "triggers": market_state["checklist"]
     }
-    
     sys_prompt = f"""
     You are Overlord AI. Analyze this data: {json.dumps(payload)}
     Respond STRICTLY in JSON format: {{"observation": "text", "inference": "text", "decision": "BUY/SELL/WAIT"}}
     """
-    
     try:
         res = ai_client.models.generate_content(
             model="gemini-1.5-flash", 
@@ -112,7 +101,6 @@ def get_ai_briefing():
             config=types.GenerateContentConfig(temperature=0.1)
         )
         text = res.text.strip()
-        # Aggressive JSON cleaning
         if "{" in text and "}" in text:
             text = text[text.find("{"):text.rfind("}")+1]
         return json.loads(text)
@@ -128,18 +116,19 @@ def main_loop():
     
     while True:
         try:
-            # 1. Use the Live Tick from WebSocket, fallback if it drops
-            if latest_tick:
+            # 1. PRICE FETCH: Use Deriv WebSocket if active, else fallback to Gold-API
+            if latest_tick and (time.time() - last_tick_time < 5):
                 gold_price = latest_tick
             else:
-                res = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT", timeout=5).json()
+                # Fallback to Gold-API (Correct XAUUSD price, not PAXG)
+                res = requests.get("https://api.gold-api.com/price/XAU", timeout=5).json()
                 gold_price = float(res['price'])
             
             gold_prices.append(gold_price)
             if len(gold_prices) > 100: gold_prices.pop(0)
             market_state["current_price"] = str(round(gold_price, 2))
             
-            # 2. Time & Daily Reset (03:00 EAT)
+            # 2. Time & Daily Reset
             now_eat = datetime.now(timezone.utc) + timedelta(hours=3)
             eat_str = now_eat.strftime("%Y-%m-%d")
             eat_hour = now_eat.hour + (now_eat.minute / 60.0)
@@ -192,22 +181,20 @@ def main_loop():
                         "lots": 0.15
                     }
             
-            # 7. AI Eval (Every 10s for testing, change to 300 later)
-            if time.time() - last_ai_update > 10:
+            # 7. AI Eval
+            if time.time() - last_ai_update > 15:
                 market_state["ai_briefing"] = get_ai_briefing()
                 last_ai_update = time.time()
 
         except Exception as e:
             print(f"Engine Error: {e}")
             
-        time.sleep(0.5) # SUPER FAST REFRESH
+        time.sleep(0.2) # SUPER FAST REFRESH
 
 @app.route('/api/v1/market/xauusd')
 def get_market_data(): return jsonify(market_state)
 
 if __name__ == '__main__':
-    # Start the Deriv WebSocket in a separate thread
     threading.Thread(target=start_stream, daemon=True).start()
-    # Start the main logic loop
     threading.Thread(target=main_loop, daemon=True).start()
     app.run(host='0.0.0.0', port=10000)
