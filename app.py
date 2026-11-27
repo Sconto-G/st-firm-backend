@@ -42,12 +42,9 @@ market_state = {
     "session_history": []
 }
 
-# Core Variables
 gold_prices = []
 silver_prices = []
 asian_high, asian_low = 0.0, 0.0
-monday_high, monday_low, weekly_open = 0.0, 0.0, 0.0
-active_fvgs = []
 daily_risk_used = 0.0
 last_reset_date = ""
 last_ai_update = 0
@@ -64,11 +61,6 @@ def send_telegram_alert(message):
 def calculate_vwap(prices):
     if not prices: return 0.0
     return sum(prices) / len(prices)
-
-def calculate_atr(prices, period=14):
-    if len(prices) < period: return 1.0
-    trs = [abs(prices[i] - prices[i-1]) for i in range(1, len(prices))]
-    return sum(trs[-period:]) / period
 
 def log_event(event):
     eat_time = (datetime.utcnow() + timedelta(hours=3)).strftime("%H:%M")
@@ -89,14 +81,14 @@ def get_ai_briefing():
     }
     
     sys_prompt = f"""
-    You are Overlord AI, a cold-blooded institutional gold trader. You command the 3-Dock Playbook.
-    Here is the live telemetry packet: {json.dumps(payload)}
+    You are Overlord AI, a cold-blooded institutional gold trader.
+    Telemetry: {json.dumps(payload)}
     
-    LAW 1 (Data Authority): Use ONLY exact numbers. If price is 0 -> output DECISION: WAIT (DATA SYNCING).
-    LAW 2 (Gate Supremacy): If Hard Lock is active OR Sweep is False OR FVG is False -> FORBIDDEN from BUY/SELL.
+    LAW 1 (Data Authority): Use ONLY exact numbers. If price is 0 -> output DECISION: WAIT.
+    LAW 2 (Gate Supremacy): If Sweep is False OR FVG is False -> FORBIDDEN from BUY/SELL.
     LAW 3 (Divergence Veto): If Volume Divergence is True -> Cut risk 50% or output WAIT.
     LAW 4 (Mirror & Invalidation): If playbook_mode is MIRROR_FLIP_BEAR, invert Dock rules to SELL.
-    LAW 5 (Fixed Output): Respond strictly in JSON: {{"observation": "facts", "inference": "storyline", "decision": "exact action"}}
+    LAW 5 (Fixed Output): Respond strictly in JSON format with keys: "observation", "inference", "decision".
     """
     
     try:
@@ -105,7 +97,17 @@ def get_ai_briefing():
             contents=sys_prompt, 
             config=types.GenerateContentConfig(temperature=0.1, response_mime_type="application/json")
         )
-        return json.loads(res.text)
+        
+        # Clean the JSON response in case Gemini adds markdown formatting
+        text = res.text.strip()
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+        
+        return json.loads(text)
+        
     except Exception as e:
         print(f"AI Error: {e}")
         return {"observation": "AI parsing error.", "inference": "Holding.", "decision": "WAIT"}
@@ -118,13 +120,14 @@ def main_loop():
     
     while True:
         try:
-            # 1. Fetch Gold and Silver (With Backup Fallback)
+            # 1. Fetch Gold (Binance PAXG is fast and tracks Gold 1:1)
             try:
+                binance_res = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT", timeout=5).json()
+                gold_price = float(binance_res['price'])
+            except:
+                # Fallback to slow API
                 gold_res = requests.get("https://api.gold-api.com/price/XAU", timeout=5).json()
                 gold_price = float(gold_res['price'])
-            except:
-                fallback = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT", timeout=5).json()
-                gold_price = float(fallback['price'])
 
             try:
                 silver_res = requests.get("https://api.gold-api.com/price/XAG", timeout=5).json()
@@ -145,13 +148,11 @@ def main_loop():
                 last_reset_date = eat_str
                 daily_risk_used = 0.0
                 market_state["session_history"] = []
-                active_fvgs = []
-                log_event("Daily Reset Complete. Calculating Mirror Flip Bias...")
+                log_event("Daily Reset Complete. Calculating Bias...")
                 market_state["structure"]["d1_bias"] = "BULL" if gold_price > calculate_vwap(gold_prices) else "BEAR"
-                market_state["structure"]["h4_bias"] = "BULL" if gold_price > calculate_vwap(gold_prices) else "BEAR"
                 market_state["structure"]["playbook_mode"] = "NORMAL_BULL" if market_state["structure"]["d1_bias"] == "BULL" else "MIRROR_FLIP_BEAR"
 
-            # 3. State Machine & Active Windows
+            # 3. State Machine
             if 4.0 <= eat_hour < 4.75: market_state["macro_state"] = "ASIAN_JUDAS_WINDOW"
             elif 6.0 <= eat_hour < 7.0: market_state["macro_state"] = "DOCK_1_RECOVERY_WINDOW"
             elif 10.0 <= eat_hour < 11.5: market_state["macro_state"] = "LONDON_OPEN_MACRO"
@@ -159,33 +160,25 @@ def main_loop():
             elif 17.0 <= eat_hour < 19.0: market_state["macro_state"] = "PM_DISTRIBUTION_WALL"
             else: market_state["macro_state"] = "HIBERNATION"
 
-            # 4. Asian Range & Monday Anchors
+            # 4. Asian Range Anchors
             if 0.0 <= eat_hour < 9.0:
                 if asian_high == 0.0 or gold_price > asian_high: asian_high = gold_price
                 if asian_low == 0.0 or gold_price < asian_low: asian_low = gold_price
-            if now_eat.weekday() == 0 and 3.0 <= eat_hour < 4.0:
-                monday_high = gold_price if monday_high == 0.0 else max(monday_high, gold_price)
-                monday_low = gold_price if monday_low == 0.0 else min(monday_low, gold_price)
-                if weekly_open == 0.0: weekly_open = gold_price
                 
             if asian_low == 0.0: asian_low = gold_price - 10.0
             if asian_high == 0.0: asian_high = gold_price + 10.0
 
-            # 5. Liquidity Matrix (Points Math)
+            # 5. Liquidity Matrix
             vwap = calculate_vwap(gold_prices)
-            target_sell = asian_low
-            target_buy = asian_high
-            
-            market_state["liquidity_matrix"]["buyside"] = {"name": "Asian High", "price": round(target_buy, 2), "distance": round(abs(target_buy - gold_price), 2)}
+            market_state["liquidity_matrix"]["buyside"] = {"name": "Asian High", "price": round(asian_high, 2), "distance": round(abs(asian_high - gold_price), 2)}
             market_state["liquidity_matrix"]["equilibrium"] = {"name": "VWAP", "price": round(vwap, 2), "distance": round(abs(vwap - gold_price), 2)}
-            market_state["liquidity_matrix"]["sellside"] = {"name": "Asian Low", "price": round(target_sell, 2), "distance": round(abs(target_sell - gold_price), 2)}
+            market_state["liquidity_matrix"]["sellside"] = {"name": "Asian Low", "price": round(asian_low, 2), "distance": round(abs(asian_low - gold_price), 2)}
 
-            # 6. The 3-Step Trigger & Execution Logic
+            # 6. Checklist & Execution
             dist_to_low = abs(gold_price - asian_low)
-            dist_to_high = abs(gold_price - asian_high)
             market_state["checklist"] = {"sweep": False, "displacement": False, "fvg": False}
             
-            if market_state["macro_state"] == "LONDON_OPEN_MACRO" or market_state["macro_state"] == "DOCK_1_RECOVERY_WINDOW":
+            if market_state["macro_state"] in ["LONDON_OPEN_MACRO", "DOCK_1_RECOVERY_WINDOW"]:
                 if dist_to_low <= 1.5:
                     market_state["checklist"]["sweep"] = True
                     last_trap_lock_time = time.time()
@@ -217,7 +210,7 @@ def get_market_data(): return jsonify(market_state)
 
 @app.route('/api/v1/chat', methods=['POST'])
 def chat():
-    return jsonify({"reply": "Overlord AI Tactical Chat Online."})
+    return jsonify({"reply": "Overlord AI Online."})
 
 @app.route('/api/v1/trade', methods=['POST'])
 def trade():
