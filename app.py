@@ -1,16 +1,20 @@
 """
-ST-FIRM WATCHER backend  v2
-Live price now comes from sources Render can actually reach (probe-verified):
-  1. Binance PAXGUSDT  (polled every 1s, keep-alive session)   <- main feed
-  2. Kraken  PAXGUSD   (only when Binance is silent)
-  3. Deriv websocket   (OFF by default: it returns HTTP 520 to Render. Set ENABLE_DERIV=1 to retry)
-PAXG is a gold-backed token, so it is a PROXY for XAUUSD. If TWELVEDATA_API_KEY is set, the real
-XAU/USD quote is fetched every 150s and the gap (offset) is added to PAXG, so the HUD price tracks spot.
-Without that key the HUD marks the price as PROXY.
+ST-FIRM WATCHER backend  v3
+
+SPEED   Binance websocket (bid pushes, ~100ms) is the main feed; REST polling is only a backup.
+START   On every boot (and each new EAT day) the server back-fills Asian range, PDH/PDL and recent candles
+        from Binance klines, so a Render restart no longer wipes your levels.
+ACCURACY  Prices are PAXG (gold token) + an OFFSET that aligns them with your broker:
+          - POST /api/v1/sync  (X-Admin-Token) lets you align to the price on YOUR MT5 screen, or
+          - TWELVEDATA_API_KEY aligns to spot XAU/USD automatically every 150s.
+          The engine works in raw PAXG space and adds the offset only when publishing, so a new
+          calibration shifts every level consistently.
 Analysis only: /trade and /campaign/action are disabled stubs. No orders are ever sent.
 """
 import os
 import json
+import hmac
+import math
 import time
 import asyncio
 import threading
@@ -34,6 +38,7 @@ CORS(app)  # TODO before any execution exists: restrict to your Vercel domain
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY")
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN")            # enables /api/v1/sync (broker alignment)
 ENABLE_DERIV = os.environ.get("ENABLE_DERIV", "0") == "1"
 DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "1089")
 PROBE_ON_START = os.environ.get("PROBE_ON_START", "0") == "1"
@@ -44,7 +49,8 @@ SL_BUFFER = 3.5                     # points below the sweep low
 RR = 2.0                            # TP = entry + RR * risk
 SETUP_LIFETIME = 30 * 60            # seconds an A+ setup stays on screen
 STALE_AFTER = 15                    # seconds without a tick = feed down
-CAL_MAX_AGE = 6 * 3600              # a calibration older than this is ignored
+CAL_MAX_AGE = 6 * 3600              # automatic (Twelve Data) calibration expires after this
+EAT = timedelta(hours=3)
 
 ai_client = None
 if GEMINI_API_KEY and genai is not None:
@@ -71,9 +77,10 @@ def warn(key, msg, every=60):
 
 # ------------------------------------------------------------------ STATE
 STARTED = time.time()
+state_lock = threading.RLock()
 
 raw = {"price": None, "source": None, "ts": 0.0, "ticks": 0}
-cal = {"offset": 0.0, "ts": 0.0, "ref": None, "ref_ts": 0.0}
+cal = {"offset": 0.0, "ts": 0.0, "ref": None, "ref_ts": 0.0, "manual": False}
 feed_err = {}
 
 market_state = {
@@ -86,19 +93,25 @@ market_state = {
         "equilibrium": {"name": "SESSION AVG", "price": 0.0, "distance": 0.0},
         "sellside": {"name": "Asian Low", "price": 0.0, "distance": 0.0},
     },
+    "levels": {"pdh": 0.0, "pdl": 0.0},
     "checklist": {"sweep": False, "displacement": False, "fvg": False},
     "execution": {"grade": "WAITING", "entry": 0.0, "sl": 0.0, "tp": 0.0, "risk_pct": 1.0, "lots": 0.0},
     "ai_briefing": {"observation": "Initializing...", "inference": "Initializing...", "decision": "WAIT"},
-    "feed": {"ok": False, "source": None, "age_sec": None, "proxy": True, "calibrated": False, "offset": 0.0},
+    "feed": {"ok": False, "source": None, "age_sec": None, "proxy": True, "calibrated": False,
+             "manual": False, "offset": 0.0, "raw_price": None},
     "range_ready": False,
     "uptime_sec": 0,
     "session_history": [],
 }
 
-day = {"date": "", "asian_high": 0.0, "asian_low": 0.0, "sum": 0.0, "n": 0,
+# everything in `day` is stored in RAW (PAXG) price space
+day = {"date": "", "asian_high": 0.0, "asian_low": 0.0, "sum": 0.0, "n": 0, "hi": 0.0, "lo": 0.0,
+       "pdh": 0.0, "pdl": 0.0,
        "swept": False, "sweep_low": None, "displaced": False, "fvg": False, "exec_ts": 0.0}
 
-candles = []  # 1-minute candles built from the price
+candles = []  # 1-minute candles, raw space
+backfill_event = threading.Event()
+backfill_info = {"last_ok": None, "last_problem": None, "runs": 0}
 
 
 def set_raw(p, source):
@@ -108,19 +121,29 @@ def set_raw(p, source):
     raw["ticks"] += 1
 
 
-def output_price():
-    """Returns (price or None, feed-meta). Applies the XAU/PAXG offset when we have a fresh one."""
+def current_offset():
+    """(offset, calibrated, manual). Deriv quotes real spot, so it never needs an offset."""
+    if raw["source"] == "deriv":
+        return 0.0, False, False
+    if cal["manual"]:
+        return cal["offset"], True, True
+    if cal["ts"] > 0 and (time.time() - cal["ts"]) < CAL_MAX_AGE:
+        return cal["offset"], True, False
+    return 0.0, False, False
+
+
+def feed_meta():
+    """(raw price or None, meta dict for the HUD)."""
     now = time.time()
     age = now - raw["ts"] if raw["ts"] else None
-    if raw["price"] is None or age is None or age > STALE_AFTER:
-        return None, {"ok": False, "source": raw["source"], "age_sec": round(age, 1) if age is not None else None,
-                      "proxy": True, "calibrated": False, "offset": 0.0}
-    exact = raw["source"] == "deriv"   # Deriv quotes real spot, no offset needed
-    use_off = (not exact) and cal["ts"] > 0 and (now - cal["ts"]) < CAL_MAX_AGE
-    price = raw["price"] + (cal["offset"] if use_off else 0.0)
-    return price, {"ok": True, "source": raw["source"], "age_sec": round(age, 1),
-                   "proxy": (not exact) and (not use_off), "calibrated": bool(use_off),
-                   "offset": round(cal["offset"], 2) if use_off else 0.0}
+    off, calibrated, manual = current_offset()
+    fresh = raw["price"] is not None and age is not None and age <= STALE_AFTER
+    meta = {"ok": bool(fresh), "source": raw["source"],
+            "age_sec": round(age, 1) if age is not None else None,
+            "proxy": (raw["source"] != "deriv") and (not calibrated),
+            "calibrated": calibrated, "manual": manual, "offset": round(off, 2),
+            "raw_price": round(raw["price"], 2) if raw["price"] is not None else None}
+    return (raw["price"] if fresh else None), meta
 
 
 def update_candles(price, now_ts):
@@ -132,7 +155,7 @@ def update_candles(price, now_ts):
         c["c"] = price
     else:
         candles.append({"m": minute, "o": price, "h": price, "l": price, "c": price})
-        if len(candles) > 120:
+        if len(candles) > 300:
             candles.pop(0)
 
 
@@ -145,19 +168,48 @@ def bullish_fvg():
 
 
 # ------------------------------------------------------------------ PRICE FEEDS
+async def _binance_ws():
+    import websockets
+    urls = ["wss://stream.binance.com:9443/ws/paxgusdt@bookTicker",
+            "wss://stream.binance.com:443/ws/paxgusdt@bookTicker"]
+    i = 0
+    while True:
+        url = urls[i % len(urls)]
+        try:
+            async with websockets.connect(url, ping_interval=20, open_timeout=10) as ws:
+                log("Binance WS connected:", url)
+                feed_err.pop("binance_ws", None)
+                while True:
+                    msg = await asyncio.wait_for(ws.recv(), timeout=30)
+                    d = json.loads(msg)
+                    if "b" in d:                       # best BID, same side an MT5 chart draws
+                        set_raw(float(d["b"]), "binance-ws")
+        except Exception as e:
+            feed_err["binance_ws"] = f"{type(e).__name__}: {str(e)[:100]}"
+            warn("binance_ws", feed_err["binance_ws"], every=120)
+            i += 1
+            await asyncio.sleep(3)
+
+
+def start_binance_ws():
+    asyncio.run(_binance_ws())
+
+
 def poll_binance():
+    """REST backup. Idle while the websocket is healthy."""
     s = requests.Session()
     s.headers.update({"User-Agent": "Mozilla/5.0"})
     fails = 0
     while True:
         try:
-            r = s.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": "PAXGUSDT"}, timeout=(4, 4))
-            r.raise_for_status()
-            set_raw(float(r.json()["price"]), "binance-paxg")
-            if fails:
-                log("Binance feed recovered")
-            fails = 0
-            feed_err.pop("binance", None)
+            if time.time() - raw["ts"] > 3:
+                r = s.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": "PAXGUSDT"}, timeout=(4, 4))
+                r.raise_for_status()
+                set_raw(float(r.json()["price"]), "binance-rest")
+                if fails:
+                    log("Binance REST recovered")
+                fails = 0
+                feed_err.pop("binance", None)
         except Exception as e:
             fails += 1
             feed_err["binance"] = f"{type(e).__name__}: {str(e)[:100]}"
@@ -166,7 +218,7 @@ def poll_binance():
 
 
 def poll_kraken():
-    """Backup only: runs when Binance has been silent for 5s."""
+    """Last-resort backup: runs when nothing has ticked for 5s."""
     s = requests.Session()
     s.headers.update({"User-Agent": "Mozilla/5.0"})
     while True:
@@ -184,9 +236,9 @@ def poll_kraken():
 
 
 def calibrate_loop():
-    """Real XAU/USD every 150s (free plan = 800 calls/day) -> offset between spot and the PAXG proxy."""
+    """Spot XAU/USD every 150s (free plan = 800 calls/day). Skipped while a manual MT5 sync is active."""
     if not TWELVEDATA_API_KEY:
-        log("Calibration OFF: set TWELVEDATA_API_KEY to align the PAXG proxy with XAU/USD")
+        log("Auto-calibration OFF (no TWELVEDATA_API_KEY). Use /api/v1/sync or the SYNC tap in the HUD.")
         return
     s = requests.Session()
     while True:
@@ -194,7 +246,10 @@ def calibrate_loop():
         try:
             fresh = raw["price"] is not None and time.time() - raw["ts"] < STALE_AFTER and raw["source"] != "deriv"
             if not fresh:
-                time.sleep(3)   # no proxy price yet (startup) - wait for it instead of burning a call
+                time.sleep(3)
+                continue
+            if cal["manual"]:
+                time.sleep(60)
                 continue
             r = s.get("https://api.twelvedata.com/price",
                       params={"symbol": "XAU/USD", "apikey": TWELVEDATA_API_KEY}, timeout=(4, 6))
@@ -203,8 +258,7 @@ def calibrate_loop():
                 raise RuntimeError(str(j.get("message", j))[:140])
             ref = float(j["price"])
             cal["ref"], cal["ref_ts"] = ref, time.time()
-            fresh = raw["price"] is not None and time.time() - raw["ts"] < STALE_AFTER and raw["source"] != "deriv"
-            if fresh:
+            if raw["price"] is not None and time.time() - raw["ts"] < STALE_AFTER:
                 new = ref - raw["price"]
                 if abs(new) <= 0.03 * ref:
                     cal["offset"] = new if cal["ts"] == 0 else 0.6 * new + 0.4 * cal["offset"]
@@ -216,7 +270,7 @@ def calibrate_loop():
         except Exception as e:
             feed_err["twelvedata"] = f"{type(e).__name__}: {str(e)[:140]}"
             warn("twelvedata", feed_err["twelvedata"], every=300)
-            wait = 60   # a bad key / hiccup: try again in a minute, not 2.5
+            wait = 60
         time.sleep(wait)
 
 
@@ -245,34 +299,121 @@ def start_deriv():
     asyncio.run(_deriv_stream())
 
 
+# ------------------------------------------------------------------ BACKFILL (Binance klines)
+def eat_day_bounds(now_utc=None):
+    """UTC instants of today's EAT midnight / Asian end / previous EAT midnight, plus today's date string."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+    now_eat = now_utc + EAT
+    today0 = datetime(now_eat.year, now_eat.month, now_eat.day, tzinfo=timezone.utc) - EAT
+    return today0, today0 + timedelta(hours=ASIAN_END), today0 - timedelta(hours=24), now_eat.strftime("%Y-%m-%d")
+
+
+def apply_backfill(k5, k1, now_utc=None):
+    """Merge historical klines into today's state. k5/k1 are Binance kline arrays (raw PAXG space)."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+    today0, asian_end, prev0, date_str = eat_day_bounds(now_utc)
+    t0, ta, tp = (int(x.timestamp() * 1000) for x in (today0, asian_end, prev0))
+    tnow = int(now_utc.timestamp() * 1000)
+    pdh = pdl = ah = al = None
+    s = n = 0
+    hi = lo = None
+    for k in k5:
+        t, h, l, c = int(k[0]), float(k[2]), float(k[3]), float(k[4])
+        if tp <= t < t0:
+            pdh = h if pdh is None else max(pdh, h)
+            pdl = l if pdl is None else min(pdl, l)
+        if t0 <= t < min(ta, tnow):
+            ah = h if ah is None else max(ah, h)
+            al = l if al is None else min(al, l)
+        if t >= t0:
+            s += c
+            n += 1
+            hi = h if hi is None else max(hi, h)
+            lo = l if lo is None else min(lo, l)
+    with state_lock:
+        if day["date"] != date_str:
+            reset_day(date_str)
+        if pdh is not None:
+            day["pdh"], day["pdl"] = pdh, pdl
+        if ah is not None:
+            day["asian_high"] = ah if day["asian_high"] == 0.0 else max(day["asian_high"], ah)
+            day["asian_low"] = al if day["asian_low"] == 0.0 else min(day["asian_low"], al)
+        if hi is not None:
+            day["hi"] = hi if day["hi"] == 0.0 else max(day["hi"], hi)
+            day["lo"] = lo if day["lo"] == 0.0 else min(day["lo"], lo)
+        if n and day["n"] < 20:               # fresh boot: seed the session average
+            day["sum"], day["n"] = s, n
+        if k1 and len(candles) < 5:           # fresh boot: seed 1-minute candles
+            candles[:] = [{"m": int(k[0]) // 60000, "o": float(k[1]), "h": float(k[2]),
+                           "l": float(k[3]), "c": float(k[4])} for k in k1][-300:]
+    return {"pdh": pdh, "pdl": pdl, "asian_high": ah, "asian_low": al, "bars5": len(k5), "bars1": len(k1)}
+
+
+def backfill_loop():
+    s = requests.Session()
+    s.headers.update({"User-Agent": "Mozilla/5.0"})
+    base = "https://api.binance.com/api/v3/klines"
+    while True:
+        backfill_event.wait(timeout=1800)       # new day or every 30 min
+        backfill_event.clear()
+        try:
+            r5 = s.get(base, params={"symbol": "PAXGUSDT", "interval": "5m", "limit": 1000}, timeout=(5, 10))
+            r5.raise_for_status()
+            r1 = s.get(base, params={"symbol": "PAXGUSDT", "interval": "1m", "limit": 120}, timeout=(5, 10))
+            r1.raise_for_status()
+            info = apply_backfill(r5.json(), r1.json())
+            backfill_info.update(last_ok=time.time(), last_problem=None, runs=backfill_info["runs"] + 1)
+            log("Backfill OK:", info)
+        except Exception as e:
+            backfill_info["last_problem"] = f"{type(e).__name__}: {str(e)[:120]}"
+            warn("backfill", backfill_info["last_problem"], every=30)
+            time.sleep(20)
+            backfill_event.set()                # retry soon
+
+
 # ------------------------------------------------------------------ ENGINE
 def reset_day(date_str):
-    day.update({"date": date_str, "asian_high": 0.0, "asian_low": 0.0, "sum": 0.0, "n": 0,
+    prev_hi, prev_lo = day["hi"], day["lo"]
+    day.update({"date": date_str, "asian_high": 0.0, "asian_low": 0.0, "sum": 0.0, "n": 0, "hi": 0.0, "lo": 0.0,
                 "swept": False, "sweep_low": None, "displaced": False, "fvg": False, "exec_ts": 0.0})
+    if prev_hi:                                  # yesterday's range becomes PDH/PDL until backfill refines it
+        day["pdh"], day["pdl"] = prev_hi, prev_lo
     market_state["execution"] = {"grade": "WAITING", "entry": 0.0, "sl": 0.0, "tp": 0.0,
                                  "risk_pct": 1.0, "lots": 0.0}
     market_state["session_history"] = []
+    backfill_event.set()
     log("New EAT day:", date_str, "- ranges reset")
 
 
 def engine_step():
-    now = datetime.now(timezone.utc) + timedelta(hours=3)
+    with state_lock:
+        _engine_step()
+
+
+def _engine_step():
+    now = datetime.now(timezone.utc) + EAT
     date_str = now.strftime("%Y-%m-%d")
     h = now.hour + now.minute / 60.0
 
-    price, meta = output_price()
+    p, meta = feed_meta()
     market_state["feed"] = meta
     market_state["uptime_sec"] = int(time.time() - STARTED)
-    if price is None:
+    if p is None:
         return
+    off = meta["offset"]
+
+    def px(v):
+        return round(v + off, 2)
 
     if date_str != day["date"]:
         reset_day(date_str)
 
-    market_state["current_price"] = str(round(price, 2))
-    update_candles(price, time.time())
-    day["sum"] += price
+    market_state["current_price"] = str(px(p))
+    update_candles(p, time.time())
+    day["sum"] += p
     day["n"] += 1
+    day["hi"] = p if day["hi"] == 0.0 else max(day["hi"], p)
+    day["lo"] = p if day["lo"] == 0.0 else min(day["lo"], p)
     avg = day["sum"] / day["n"]  # session AVERAGE price (no volume data, so not a true VWAP)
 
     if 4.0 <= h < 4.75:
@@ -290,37 +431,38 @@ def engine_step():
     market_state["macro_state"] = ms
 
     if ASIAN_START <= h < ASIAN_END:
-        if day["asian_high"] == 0.0 or price > day["asian_high"]:
-            day["asian_high"] = price
-        if day["asian_low"] == 0.0 or price < day["asian_low"]:
-            day["asian_low"] = price
+        if day["asian_high"] == 0.0 or p > day["asian_high"]:
+            day["asian_high"] = p
+        if day["asian_low"] == 0.0 or p < day["asian_low"]:
+            day["asian_low"] = p
     range_ready = h >= ASIAN_END and day["asian_low"] > 0.0
     market_state["range_ready"] = range_ready
 
-    market_state["structure"]["d1_bias"] = "BULL" if price > avg else "BEAR"   # temporary rule
-    market_state["structure"]["playbook_mode"] = "NORMAL_BULL" if price > avg else "MIRROR_FLIP_BEAR"
+    market_state["structure"]["d1_bias"] = "BULL" if p > avg else "BEAR"   # temporary rule
+    market_state["structure"]["playbook_mode"] = "NORMAL_BULL" if p > avg else "MIRROR_FLIP_BEAR"
 
     ah, al = day["asian_high"], day["asian_low"]
     lm = market_state["liquidity_matrix"]
-    lm["buyside"] = {"name": "Asian High", "price": round(ah, 2), "distance": round(abs(ah - price), 2) if ah else 0.0}
-    lm["equilibrium"] = {"name": "SESSION AVG", "price": round(avg, 2), "distance": round(abs(avg - price), 2)}
-    lm["sellside"] = {"name": "Asian Low", "price": round(al, 2), "distance": round(abs(al - price), 2) if al else 0.0}
+    lm["buyside"] = {"name": "Asian High", "price": px(ah) if ah else 0.0, "distance": round(abs(ah - p), 2) if ah else 0.0}
+    lm["equilibrium"] = {"name": "SESSION AVG", "price": px(avg), "distance": round(abs(avg - p), 2)}
+    lm["sellside"] = {"name": "Asian Low", "price": px(al) if al else 0.0, "distance": round(abs(al - p), 2) if al else 0.0}
+    market_state["levels"] = {"pdh": px(day["pdh"]) if day["pdh"] else 0.0,
+                              "pdl": px(day["pdl"]) if day["pdl"] else 0.0}
 
     if range_ready and ms in ("LONDON_OPEN_MACRO", "NY_OPEN_MACRO"):
-        if price < al:
+        if p < al:
             day["swept"] = True
-            day["sweep_low"] = price if day["sweep_low"] is None else min(day["sweep_low"], price)
-        if day["swept"] and price > al + SWEEP_DISPLACEMENT:
+            day["sweep_low"] = p if day["sweep_low"] is None else min(day["sweep_low"], p)
+        if day["swept"] and p > al + SWEEP_DISPLACEMENT:
             day["displaced"] = True
         if day["swept"] and bullish_fvg():
             day["fvg"] = True
         if day["swept"] and day["displaced"] and day["fvg"] and day["exec_ts"] == 0.0:
             sl = min(day["sweep_low"], al) - SL_BUFFER
-            risk = price - sl
+            risk = p - sl
             market_state["execution"] = {
                 "grade": "A+ [3/3 GATES MET]",
-                "entry": round(price, 2), "sl": round(sl, 2),
-                "tp": round(price + RR * risk, 2),
+                "entry": px(p), "sl": px(sl), "tp": px(p + RR * risk),
                 "risk_pct": 0.4, "lots": 0.0,
             }
             day["exec_ts"] = time.time()
@@ -344,22 +486,23 @@ def engine_loop():
                 last_hb = time.time()
                 f = market_state["feed"]
                 log(f"heartbeat price={market_state['current_price']} src={f.get('source')} "
-                    f"proxy={f.get('proxy')} offset={f.get('offset')} state={market_state['macro_state']} "
-                    f"ticks={raw['ticks']}")
+                    f"proxy={f.get('proxy')} offset={f.get('offset')} manual={f.get('manual')} "
+                    f"state={market_state['macro_state']} ticks={raw['ticks']}")
         except Exception as e:
             warn("engine", f"{type(e).__name__}: {e}", every=10)
             time.sleep(2)
-        time.sleep(0.5)
+        time.sleep(0.25)
 
 
 # ------------------------------------------------------------------ AI
 def ai_context():
-    return {"clock_eat": (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%H:%M"),
+    return {"clock_eat": (datetime.now(timezone.utc) + EAT).strftime("%H:%M"),
             "price": market_state["current_price"],
             "price_is_proxy": market_state["feed"].get("proxy"),
             "macro_state": market_state["macro_state"],
             "structure": market_state["structure"],
             "liquidity": market_state["liquidity_matrix"],
+            "levels": market_state["levels"],
             "checklist": market_state["checklist"],
             "execution": market_state["execution"]}
 
@@ -395,7 +538,8 @@ def ai_loop():
 # ------------------------------------------------------------------ OUTBOUND PROBE (diagnostics)
 PROBE_TARGETS = {
     "google": "https://www.google.com/generate_204",
-    "binance-paxg": "https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT",
+    "binance-rest": "https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT",
+    "binance-klines": "https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval=1m&limit=2",
     "kraken-paxg": "https://api.kraken.com/0/public/Ticker?pair=PAXGUSD",
     "twelvedata": "https://api.twelvedata.com/price?symbol=XAU/USD",
 }
@@ -440,10 +584,11 @@ def debug():
         "output": market_state["feed"],
         "calibration": {**cal, "age_sec": round(time.time() - cal["ts"], 1) if cal["ts"] else None},
         "source_problems": feed_err,
+        "backfill": backfill_info,
         "threads": {t.name: t.is_alive() for t in threading.enumerate()},
         "candles": len(candles),
-        "day": {k: day[k] for k in ("date", "asian_high", "asian_low", "n", "swept", "displaced", "fvg")},
-        "keys": {"gemini": bool(GEMINI_API_KEY), "twelvedata": bool(TWELVEDATA_API_KEY)},
+        "day": {k: day[k] for k in ("date", "asian_high", "asian_low", "pdh", "pdl", "n", "swept", "displaced", "fvg")},
+        "keys": {"gemini": bool(GEMINI_API_KEY), "twelvedata": bool(TWELVEDATA_API_KEY), "admin_token": bool(ADMIN_TOKEN)},
         "gemini_model": GEMINI_MODEL,
         "deriv_enabled": ENABLE_DERIV,
     })
@@ -453,6 +598,37 @@ def debug():
 def probe():
     run_probe()
     return jsonify(probe_results)
+
+
+@app.route("/api/v1/sync", methods=["POST"])
+def sync():
+    """Align the HUD to YOUR broker. Body: {"price": 3650.83} (price on your MT5 now) or {"offset": 10.6} or {"clear": true}."""
+    if not ADMIN_TOKEN:
+        return jsonify({"status": "disabled", "message": "Set ADMIN_TOKEN in Render to enable broker sync."}), 403
+    tok = request.headers.get("X-Admin-Token", "")
+    if not hmac.compare_digest(tok.encode(), ADMIN_TOKEN.encode()):
+        return jsonify({"status": "denied", "message": "Wrong token."}), 401
+    body = request.get_json(silent=True) or {}
+    if body.get("clear"):
+        cal.update(manual=False, ts=0.0, offset=0.0)
+        return jsonify({"status": "ok", "message": "Manual sync cleared."})
+    try:
+        if "offset" in body:
+            off = float(body["offset"])
+        elif "price" in body:
+            if raw["price"] is None or time.time() - raw["ts"] > STALE_AFTER:
+                return jsonify({"status": "error", "message": "No fresh feed yet, try again in a few seconds."}), 409
+            off = float(body["price"]) - raw["price"]
+        else:
+            return jsonify({"status": "error", "message": "Send price, offset or clear."}), 400
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "Not a number."}), 400
+    limit = 0.05 * (raw["price"] or 4000.0)
+    if not math.isfinite(off) or abs(off) > limit:
+        return jsonify({"status": "error", "message": f"Offset {off:.2f} is outside +/-{limit:.0f}; check the number."}), 400
+    cal.update(offset=off, ts=time.time(), manual=True)
+    log(f"Manual sync: offset={off:.2f}")
+    return jsonify({"status": "ok", "offset": round(off, 2), "message": "HUD aligned to your broker."})
 
 
 @app.route("/api/v1/chat", methods=["POST"])
@@ -491,17 +667,18 @@ def campaign_action():
 
 # ------------------------------------------------------------------ BOOT
 def start_threads():
-    specs = [(poll_binance, "binance"), (poll_kraken, "kraken"), (calibrate_loop, "calibrate"),
-             (engine_loop, "engine"), (ai_loop, "ai")]
+    specs = [(start_binance_ws, "binance-ws"), (poll_binance, "binance-rest"), (poll_kraken, "kraken"),
+             (calibrate_loop, "calibrate"), (backfill_loop, "backfill"), (engine_loop, "engine"), (ai_loop, "ai")]
     if ENABLE_DERIV:
         specs.append((start_deriv, "deriv"))
     if PROBE_ON_START:
         specs.append((run_probe, "probe"))
     for fn, name in specs:
         threading.Thread(target=fn, name=name, daemon=True).start()
+    backfill_event.set()
 
 
 if __name__ == "__main__":
-    log("Starting ST-FIRM backend v2")
+    log("Starting ST-FIRM backend v3")
     start_threads()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), threaded=True)
